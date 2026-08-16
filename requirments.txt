@@ -1,0 +1,26 @@
+# Web framework and server
+fastapi==0.115.0
+uvicorn[standard]==0.30.6
+websockets==13.1
+
+# Speech-to-text (local, free, CPU)
+faster-whisper==1.0.3
+
+# LLM agent brain (Groq free tier)
+groq==0.11.0
+
+# Text-to-speech (free, no API key)
+edge-tts==6.1.12
+
+# Config / environment variables
+python-dotenv==1.0.1
+
+# Database (SQLite via ORM)
+sqlalchemy==2.0.35
+
+# Audio processing
+numpy==1.26.4
+webrtcvad==2.0.10
+
+# CORS / dev convenience (needed since React runs on a different port than FastAPI)
+python-multipart==0.0.9
