@@ -1,0 +1,19 @@
+# Extra dependencies for testing NAMAA-Egyptian-TTS (Chatterbox-based).
+#
+# IMPORTANT: torch/torchaudio must be installed as CPU-only builds, or pip
+# will pull in full CUDA support you can't use without a GPU — that adds
+# gigabytes of unnecessary download and disk space for nothing.
+#
+# Install in this exact order:
+#
+#   pip install torch torchaudio --index-url https://download.pytorch.org/whl/cpu
+#   pip install -r requirements-namaa-test.txt
+#
+# The --index-url line above installs the CPU-only build. Do NOT run a
+# plain `pip install torch` first — once the default (CUDA) build is
+# installed, pip may not automatically swap it for the CPU-only one on a
+# later install.
+
+chatterbox-tts
+huggingface-hub
+safetensors

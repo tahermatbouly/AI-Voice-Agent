@@ -1,0 +1,29 @@
+@import url('https://fonts.googleapis.com/css2?family=Cairo:wght@400;600;700&display=swap');
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+body {
+  margin: 0;
+  font-family: 'Cairo', system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+  color: #062a66; /* brand navy */
+  background: linear-gradient(180deg, #f7fbff 0%, #ffffff 35%);
+}
+
+#root {
+  min-height: 100svh;
+  display: flex;
+  flex-direction: column;
+}
+
+a {
+  color: inherit;
+  text-decoration: none;
+}
+
+/* Better default focus visibility */
+:focus-visible {
+  outline: 2px solid rgb(31 139 255 / 0.9);
+  outline-offset: 2px;
+}

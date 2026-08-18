@@ -1,0 +1,22 @@
+# Extra dependencies for testing EGTTS-V0.1 (XTTS v2 based Egyptian Arabic TTS).
+# Install separately, AFTER installing CPU-only torch (reuses the same
+# torch/torchaudio you already installed for NAMAA testing, if present):
+#
+#   pip install torch torchaudio --index-url https://download.pytorch.org/whl/cpu
+#   pip install -r requirements-egtts-test.txt
+#
+# IMPORTANT: the original `TTS` package (coqui-ai/TTS) is unmaintained and
+# hard-caps at Python < 3.12 -- it will fail to install on Python 3.13.
+# Use `coqui-tts` instead: the actively maintained community fork
+# (idiap/coqui-ai-TTS), which supports Python 3.10-3.14 and keeps the
+# exact same `from TTS.api import TTS` import path, so no code changes
+# are needed beyond the package name.
+#
+# NOTE: deepspeed is deliberately NOT included here. It's an optional
+# inference accelerator mentioned in EGTTS's model card, but it's a heavy,
+# GPU-oriented install that offers little benefit on CPU-only hardware --
+# skip it unless you specifically hit a need for it later.
+
+coqui-tts
+transformers
+huggingface-hub

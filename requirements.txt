@@ -4,7 +4,7 @@ uvicorn[standard]==0.30.6
 websockets==13.1
 
 # Speech-to-text (local, free, CPU)
-faster-whisper==1.0.3
+faster-whisper==1.2.1
 
 # LLM agent brain (Groq free tier)
 groq==0.11.0
