@@ -176,4 +176,4 @@ class ExtractionTools:
             notes=notes,
         )
 
-        return "Data is saved successfully. Thank you for providing the information.:{record}"
+        return "Data is saved successfully."

@@ -65,12 +65,6 @@ EXTRACTION_FIELDS = [
     "notes",               # free-form additional info
 ]
 
-# ---------------------------------------------------------------------
-# Mem0 (cross-call caller memory)
-# ---------------------------------------------------------------------
-MEM0_API_KEY = os.getenv("MEM0_API_KEY", "")  # only needed if using
-                                                # Mem0's hosted service
-                                                # rather than self-hosted
 
 # ---------------------------------------------------------------------
 # Storage
@@ -104,3 +98,27 @@ SYSTEM_PROMPT = """\
 لو حسيت إن المكالمة خلصت (المتصل قال مع السلامة أو خلص كل حاجة عايز يقولها)،
 اختم المكالمة بشكل مهذب واشكره على وقته.
 """
+
+# ---------------------------------------------------------------------
+# Vector memory
+# ---------------------------------------------------------------------
+
+QDRANT_URL = os.getenv(
+    "QDRANT_URL",
+    "http://localhost:6333",
+)
+
+QDRANT_COLLECTION = os.getenv(
+    "QDRANT_COLLECTION",
+    "caller_memories",
+)
+
+EMBEDDING_MODEL = os.getenv(
+    "EMBEDDING_MODEL",
+    "BAAI/bge-m3",
+)
+
+EMBEDDING_DEVICE = os.getenv(
+    "EMBEDDING_DEVICE",
+    "cpu",
+)
