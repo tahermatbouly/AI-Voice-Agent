@@ -8,115 +8,54 @@ from livekit.agents import tts
 from app import config
 
 
-MODEL_DIR = Path(config.EGTTS_MODEL_PATH)
-REFERENCE_AUDIO = Path(config.EGTTS_REFERENCE_AUDIO_PATH)
-
-
-def _patch_numpy_legacy_aliases():
-    """NumPy >= 1.24 removed several deprecated aliases (np.long,
-    np.ulong, np.int, np.float, np.bool, np.object). Coqui-tts's
-    dependency chain (scipy internals) still references these directly
-    and crashes with "module 'numpy' has no attribute '...'" the moment
-    synthesis actually runs. This restores them before TTS.api is
-    imported, so nothing downstream can hit the missing attribute."""
-    import numpy as np
-    for name, replacement in (
-        ("long", int), ("ulong", int), ("int", int),
-        ("float", float), ("bool", bool), ("object", object),
-    ):
-        if not hasattr(np, name):
-            setattr(np, name, replacement)
-
-
-_patch_numpy_legacy_aliases()
-
-from TTS.api import TTS
-
-def normalize_egyptian_text(text: str) -> str:
-    """
-    Prepare Arabic text for EGTTS.
-
-    The goal is not to translate the text.
-    We only make the text easier for the TTS model
-    to pronounce naturally.
-    """
-
-    replacements = {
-        # Common formal → Egyptian forms
-        "هل يمكنك": "ممكن",
-        "هل تستطيع": "ممكن",
-        "يرجى": "ممكن",
-        "نود معرفة": "عايزين نعرف",
-        "أود معرفة": "عايز أعرف",
-        "تزويدي": "تقولّي",
-        "المتقدم": "حضرتك",
-        "المتقدمة": "حضرتك",
-
-        # Common HR phrases
-        "الوظيفة التي تتقدم لها": "الوظيفة اللي بتقدم عليها",
-        "الوظيفة المتقدم لها": "الوظيفة اللي بتقدم عليها",
-        "سنوات الخبرة": "سنين الخبرة",
-        "الراتب الحالي": "المرتب الحالي",
-        "الراتب المتوقع": "المرتب المتوقع",
-        "موعد التفرغ": "ممكن تبدأ إمتى",
-        "بيانات التواصل": "رقم الموبايل",
-    }
-
-    for old, new in replacements.items():
-        text = text.replace(old, new)
-
-    # Remove characters that can hurt pronunciation.
-    text = text.replace("[", "")
-    text = text.replace("]", "")
-    text = text.replace("*", "")
-    text = text.replace("#", "")
-    text = text.replace("_", "")
-
-    # Normalize repeated whitespace.
-    text = " ".join(text.split())
-
-    return text.strip()
-
-class EGTTS(tts.TTS):
+class VoiceTut(tts.TTS):
 
     def __init__(self):
         super().__init__(
             capabilities=tts.TTSCapabilities(
                 streaming=False,
-                
             ),
-            sample_rate=24000,
+            sample_rate=config.VOICETUT_SAMPLE_RATE,
             num_channels=1,
         )
 
-        print("[TTS] Loading EGTTS-V0.1...")
+        print("[TTS] Loading VoiceTut-TTS...")
 
-        self.tts_engine = TTS(
-            model_path=str(MODEL_DIR),
-            config_path=str(MODEL_DIR / "config.json"),
-            gpu=False,
-            progress_bar=False,
+        from voicetut_tts import VoiceTutTTS
+
+        self.tts_engine = VoiceTutTTS.from_pretrained(
+            config.VOICETUT_MODEL
         )
 
-        print("[TTS] EGTTS-V0.1 loaded.")
+        self.speaker = config.VOICETUT_SPEAKER
+
+        print("[TTS] VoiceTut-TTS loaded.")
+        print(f"[TTS] Speaker: {self.speaker}")
 
     def synthesize(self, text, *, conn_options=None):
 
-        original_text = text
+        text = " ".join(text.split())
 
-        text = normalize_egyptian_text(text)
+        if not text:
+            return VoiceTutStream(
+                tts_instance=self,
+                input_text="",
+                conn_options=conn_options,
+            )
 
-        print(f"[TTS] original: {original_text}")
-        print(f"[TTS] normalized: {text}")
+        if len(text) > config.VOICETUT_MAX_TEXT_LENGTH:
+            text = text[:config.VOICETUT_MAX_TEXT_LENGTH]
 
-        return EGTTSStream(
+        print(f"[TTS] text: {text}")
+
+        return VoiceTutStream(
             tts_instance=self,
             input_text=text,
             conn_options=conn_options,
         )
 
 
-class EGTTSStream(tts.ChunkedStream):
+class VoiceTutStream(tts.ChunkedStream):
 
     def __init__(
         self,
@@ -130,11 +69,17 @@ class EGTTSStream(tts.ChunkedStream):
             conn_options=conn_options,
         )
 
-        self.egtts = tts_instance
+        self.voicetut = tts_instance
 
     async def _run(self, output_emitter):
 
-        print(f"[TTS] _run(): generating -> {self._input_text}")
+        if not self._input_text:
+            return
+
+        print(
+            f"[TTS] Generating VoiceTut audio -> "
+            f"{self._input_text}"
+        )
 
         loop = asyncio.get_running_loop()
 
@@ -145,12 +90,12 @@ class EGTTSStream(tts.ChunkedStream):
             )
 
             print(
-                f"[TTS] generated {len(pcm)} bytes "
+                f"[TTS] Generated {len(pcm)} bytes "
                 f"at {sample_rate} Hz"
             )
 
             output_emitter.initialize(
-                request_id="egtts",
+                request_id="voicetut",
                 sample_rate=sample_rate,
                 num_channels=1,
                 mime_type="audio/pcm",
@@ -159,10 +104,13 @@ class EGTTSStream(tts.ChunkedStream):
             output_emitter.push(pcm)
             output_emitter.flush()
 
-            print("[TTS] audio sent to LiveKit.")
+            print("[TTS] Audio sent to LiveKit.")
 
         except Exception as e:
-            print(f"[TTS] ERROR: {type(e).__name__}: {e}")
+            print(
+                f"[TTS] ERROR: "
+                f"{type(e).__name__}: {e}"
+            )
             raise
 
     def _generate(self):
@@ -171,17 +119,14 @@ class EGTTSStream(tts.ChunkedStream):
             suffix=".wav"
         ) as f:
 
-            print("[TTS] Running EGTTS inference...")
+            print("[TTS] Running VoiceTut inference...")
 
-            self.egtts.tts_engine.tts_to_file(
-                text=self._input_text,
-                speaker_wav=str(REFERENCE_AUDIO),
-                language="ar",
-                file_path=f.name,
-                split_sentences=False,
+            self.voicetut.tts_engine.synthesize(
+                self._input_text,
+                speaker=self.voicetut.speaker,
+                num_step=config.VOICETUT_NUM_STEPS,
+                output=f.name,
             )
-
-            print(f"[TTS] WAV generated: {f.name}")
 
             with wave.open(f.name, "rb") as wav:
 
@@ -202,4 +147,4 @@ class EGTTSStream(tts.ChunkedStream):
 
 
 def build_tts():
-    return EGTTS()
+    return VoiceTut()
