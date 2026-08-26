@@ -1,169 +1,308 @@
 """
-LiveKit voice agent worker.
+Main AI Voice Agent worker.
 
-This is the orchestration layer connecting:
+Pipeline:
 
+    Caller
+      |
+      v
     LiveKit
-       |
-    VAD / turn detection
-       |
-    faster-whisper STT
-       |
+      |
+      v
+    Silero VAD
+      |
+      v
+    Faster-Whisper CPU
+      |
+      v
     Groq LLM
-       |
-    HR extraction tools
-       |
-    TTS fallback chain
+      |
+      v
+    EGTTS-V0.1
+      |
+      v
+    LiveKit audio
 
-The worker intentionally contains very little business logic.
-Extraction lives in extraction.py, STT in stt_plugin.py, and TTS
-in tts_plugin.py.
-
-NOTE on turn detection: LiveKit has two different turn-detector systems.
-The older, text-based models (MultilingualModel/EnglishModel, from the
-livekit-plugins-turn-detector package) do NOT support Arabic. This file
-uses the newer audio-based livekit.agents.inference.TurnDetector instead,
-which ships directly with livekit-agents (no separate plugin install)
-and explicitly supports Arabic among its 14 documented languages. It
-requires a one-time model download -- see the setup note before
-entrypoint() below.
+NO:
+    - DeepFilterNet
+    - cloud turn detector
+    - cloud STT
+    - ElevenLabs
 """
 
-from livekit import agents
-from livekit.agents import Agent, AgentSession
-from livekit.agents.inference import TurnDetector
+from __future__ import annotations
+
+import logging
+
+from dotenv import load_dotenv
+
+from livekit.agents import (
+    Agent,
+    AgentSession,
+    JobContext,
+    WorkerOptions,
+    cli,
+)
+
 from livekit.plugins import groq, silero
 
-from app import config
-from agent.stt_plugin import WhisperSTT
+from agent.stt_plugin import FasterWhisperSTT
 from agent.tts_plugin import build_tts
-from agent.extraction import CallExtraction, ExtractionTools
-
-# Toggle: the audio TurnDetector officially supports Arabic, but its
-# real-world quality specifically on Egyptian *dialect* (vs. MSA) is
-# still unverified -- this model's language support was validated on
-# Arabic broadly, not confirmed dialect-by-dialect. Set to False to
-# fall back to plain VAD-based turn timing if it doesn't behave well
-# on Egyptian Arabic in real testing.
-USE_TURN_DETECTOR = True
+from app import config
 
 
-class RecruitmentAgent(Agent):
-    """
-    Conversational HR recruitment agent.
+load_dotenv()
 
-    The structured extraction state belongs to CallExtraction.
-    ExtractionTools exposes that state to the LLM through function tools.
-    """
+logging.basicConfig(level=logging.INFO)
 
-    def __init__(self, extraction: CallExtraction):
-        self.extraction = extraction
-        self.extraction_tools = ExtractionTools(extraction)
+logger = logging.getLogger("voice-agent")
 
+
+# ============================================================
+# SYSTEM PROMPT
+# ============================================================
+SYSTEM_PROMPT = """
+انت موظف HR في شركة GB corp، وبتكلم المتقدمين للوظايف على التليفون.
+
+اتكلم باللهجة المصرية بشكل طبيعي، بسيط، قصير، ومهذب، كأنك موظف HR حقيقي.
+
+هدف المكالمة إنك تجمع كل المعلومات دي:
+
+1. الاسم بالكامل
+2. الوظيفة الحالية
+3. سنين الخبرة
+4. المرتب الحالي
+5. موعد التوفر
+6. ملاحظات إضافية
+
+مهم جدًا:
+- كل المعلومات الستة مطلوبة.
+- لازم تحاول تجمع كل المعلومات قبل إنهاء المكالمة.
+- متسألش عن رقم الموبايل نهائيًا.
+- متسألش عن المرتب المتوقع نهائيًا.
+- اسأل سؤال واحد فقط في كل مرة.
+- متسألش عن معلومة المتصل قالها بالفعل.
+- لو المتصل ذكر أكتر من معلومة في نفس الرد، احفظهم ومتسألش عنهم تاني.
+- متخترعش أي معلومات.
+- لو المتصل رفض يدي معلومة، متضغطش عليه وانتقل للمعلومة اللي بعدها.
+- لو المتصل قال إنه مش عارف الإجابة، اعتبر المعلومة غير متوفرة وانتقل للسؤال اللي بعده.
+- لو المتصل قال إنه مسمعش السؤال، عيد السؤال ببساطة.
+- لو المتصل صحح معلومة قالها قبل كده، استخدم المعلومة الجديدة.
+- لو المتصل ذكر معلومة إضافية مهمة، احفظها في الملاحظات.
+- متفتحش أسئلة إضافية من غير داعي.
+- متستخدمش الفصحى.
+- متستخدمش كلام رسمي أو معقد.
+- متستخدمش Markdown أو رموز أو إيموجي.
+- متستخدمش أي نص بين [ ].
+- لو محتاج تقول اسم الشركة، قول "GB corp" بالظبط.
+
+ترتيب الأسئلة:
+
+ابدأ بـ:
+"أهلاً بيك، معاك HR من GB corp. ممكن أعرف اسمك بالكامل؟"
+
+بعد الاسم:
+"تمام، شغال إيه دلوقتي؟"
+
+بعد الوظيفة:
+"حلو، عندك كام سنة خبرة؟"
+
+بعد الخبرة:
+"تمام، ومرتبك الحالي كام؟"
+
+بعد المرتب:
+"حلو، تقدر تبدأ إمتى؟"
+
+بعد التوفر:
+"تمام، في حاجة تانية حابب تقولها عن نفسك؟"
+
+لو قال مفيش حاجة:
+اعتبر إن مفيش ملاحظات إضافية وسجلها كده.
+
+بعد ما تجمع المعلومات المطلوبة:
+"تمام، شكراً ليك. كده تمام."
+
+قواعد مهمة للمحادثة:
+
+- متقولش كل الأسئلة مرة واحدة.
+- استنى إجابة المتصل بعد كل سؤال.
+- خليك مختصر جدًا عشان المكالمة تكون طبيعية وسريعة.
+- لو المتصل جاوب على السؤال الحالي ومعاه إجابة لسؤال تاني، استخدم الإجابتين ومتسألش السؤال اللي اتجاوب.
+- لو المتصل خرج عن الموضوع، جاوبه باختصار لو تقدر، وبعدها ارجع للمعلومة المطلوبة اللي لسه ناقصة.
+- لو المتصل سأل عن حاجة اتقالت قبل كده في المكالمة، جاوبه من سياق المكالمة.
+- لو المتصل قال "معلش مسمعتش"، عيد آخر سؤال فقط.
+- لو المتصل قال "مع السلامة" أو واضح إنه عايز ينهي المكالمة، اختم بأدب.
+- متكررّش المعلومات أو الأسئلة بدون سبب.
+
+استخدم الصياغات دي:
+
+الاسم:
+"ممكن أعرف اسمك بالكامل؟"
+
+الوظيفة:
+"شغال إيه دلوقتي؟"
+
+الخبرة:
+"عندك كام سنة خبرة؟"
+
+المرتب:
+"مرتبك الحالي كام؟"
+
+التوفر:
+"تقدر تبدأ إمتى؟"
+
+الملاحظات:
+"في حاجة تانية حابب تقولها عن نفسك؟"
+
+خلي كل رد قصير وطبيعي وباللهجة المصرية.
+"""
+
+
+# ============================================================
+# AGENT
+# ============================================================
+
+class GBCorpAgent(Agent):
+
+    def __init__(self) -> None:
         super().__init__(
-            instructions=config.SYSTEM_PROMPT,
-            tools=[
-                self.extraction_tools.update_candidate_info,
-            ],
+            instructions=SYSTEM_PROMPT
         )
 
 
-async def entrypoint(ctx: agents.JobContext):
-    """
-    Entry point executed for each LiveKit agent job.
-    """
+# ============================================================
+# ENTRYPOINT
+# ============================================================
 
-    print("[worker] connecting to LiveKit room...")
+async def entrypoint(ctx: JobContext):
+
+    print()
+    print("=" * 60)
+    print("AI VOICE AGENT STARTING")
+    print("=" * 60)
+
+    # --------------------------------------------------------
+    # LIVEKIT
+    # --------------------------------------------------------
+
+    logger.info("[LIVEKIT] Connecting...")
+
     await ctx.connect()
-    print("[worker] connected.")
 
-    # ---------------------------------------------------------------
-    # Per-call extraction state
-    # ---------------------------------------------------------------
-    extraction = CallExtraction()
+    logger.info("[LIVEKIT] Connected to room: %s", ctx.room.name)
 
-    # ---------------------------------------------------------------
-    # VAD -- used both to wrap the non-streaming STT (below) and as
-    # AgentSession's own top-level vad= parameter for general voice
-    # activity / interruption awareness.
-    # ---------------------------------------------------------------
-    vad = silero.VAD.load(
-        min_silence_duration=0.55,
-        prefix_padding_duration=0.5,
+    # --------------------------------------------------------
+    # STT
+    # --------------------------------------------------------
+
+    logger.info(
+        "[STT] Initializing Faster-Whisper '%s'...",
+        config.WHISPER_MODEL_SIZE,
     )
 
-    # ---------------------------------------------------------------
-    # STT -- faster-whisper is non-streaming, so it's wrapped with
-    # StreamAdapter + the VAD above, which buffers audio until VAD
-    # detects a completed utterance, then hands it over in one batch.
-    # ---------------------------------------------------------------
-    whisper_stt = WhisperSTT()
-    session_stt = agents.stt.StreamAdapter(
-        stt=whisper_stt,
-        vad=vad,
+    stt = FasterWhisperSTT(
+        model_size=config.WHISPER_MODEL_SIZE,
+        device=config.WHISPER_DEVICE,
+        compute_type=config.WHISPER_COMPUTE_TYPE,
+        language=config.WHISPER_LANGUAGE,
+        beam_size=1,
     )
 
-    # ---------------------------------------------------------------
+    logger.info("[STT] Ready.")
+
+    # --------------------------------------------------------
+    # TTS
+    # --------------------------------------------------------
+
+    logger.info("[TTS] Initializing EGTTS...")
+
+    tts = build_tts()
+
+    logger.info("[TTS] Ready.")
+
+    # --------------------------------------------------------
     # LLM
-    # ---------------------------------------------------------------
+    # --------------------------------------------------------
+
+    logger.info("[LLM] Initializing Groq...")
+
     llm = groq.LLM(
         model=config.GROQ_LLM_MODEL,
         api_key=config.GROQ_API_KEY,
     )
 
-    # ---------------------------------------------------------------
-    # TTS -- the three-tier fallback chain
-    # ---------------------------------------------------------------
-    tts = build_tts()
+    logger.info("[LLM] Ready.")
 
-    # ---------------------------------------------------------------
-    # Turn detection -- audio-based TurnDetector, supports Arabic.
-    # Falls back to plain VAD-based timing if disabled below.
-    # ---------------------------------------------------------------
-    turn_detection = TurnDetector() if USE_TURN_DETECTOR else None
+    # --------------------------------------------------------
+    # VAD
+    # --------------------------------------------------------
 
-    # ---------------------------------------------------------------
-    # Agent session
-    # ---------------------------------------------------------------
+    logger.info("[VAD] Loading local Silero VAD...")
+
+    vad = silero.VAD.load(
+        min_silence_duration=0.45,
+        prefix_padding_duration=0.35,
+    )
+
+    logger.info("[VAD] Ready.")
+
+    # --------------------------------------------------------
+    # SESSION
+    # --------------------------------------------------------
+
     session = AgentSession(
-        stt=session_stt,
+        stt=stt,
         llm=llm,
         tts=tts,
         vad=vad,
-        turn_detection=turn_detection,  # None falls back to plain VAD timing
+        allow_interruptions=False,
+        preemptive_generation=False,
     )
 
-    # ---------------------------------------------------------------
-    # Start the session
-    # ---------------------------------------------------------------
-    print("[worker] starting AgentSession...")
+    logger.info("[SESSION] Starting...")
+
     await session.start(
         room=ctx.room,
-        agent=RecruitmentAgent(extraction),
+        agent=GBCorpAgent(),
     )
-    print("[worker] AgentSession started.")
 
-    # ---------------------------------------------------------------
-    # Initial greeting
-    # ---------------------------------------------------------------
+    logger.info("[SESSION] Started.")
+
+    # --------------------------------------------------------
+    # INITIAL GREETING
+    # --------------------------------------------------------
+
+    logger.info("[AGENT] Sending greeting...")
+
     await session.generate_reply(
-        instructions=(
-            "ابدأ المكالمة بتحية قصيرة ومهنية باللهجة المصرية، "
-            "وعرّف نفسك كمسؤول توظيف واسأل المتقدم عن اسمه."
-        )
+        instructions="""
+ابدأ المكالمة فورًا.
+
+قل فقط:
+"أهلاً بيك، معاك قسم الموارد البشرية من GB corp. ممكن أعرف اسمك بالكامل؟"
+
+وبعدها استنى رد المتصل.
+"""
     )
 
+    logger.info("[AGENT] Greeting sent.")
+
+    print()
+    print("=" * 60)
+    print("AI VOICE AGENT READY")
+    print("=" * 60)
+    print("Listening for caller...")
+    print()
+
+
+# ============================================================
+# WORKER
+# ============================================================
 
 if __name__ == "__main__":
-    agents.cli.run_app(
-        agents.WorkerOptions(
+
+    cli.run_app(
+        WorkerOptions(
             entrypoint_fnc=entrypoint,
-            # Default init timeout is too short for heavy CPU-only ML
-            # imports (faster-whisper, torch-based TTS, etc). Also
-            # reduce idle processes so they don't all compete for CPU
-            # at once during import -- that contention is likely why
-            # every subprocess was timing out at the same fixed mark.
-            initialize_process_timeout=120.0,
-            num_idle_processes=1,
         )
     )

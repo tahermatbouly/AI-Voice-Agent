@@ -1,28 +1,44 @@
+import time
+
 from voicetut_tts import VoiceTutTTS
 
 
-def main():
-    print("Loading VoiceTut-TTS...")
+MODEL = "mohammedaly22/VoiceTut-TTS"
 
-    tts = VoiceTutTTS.from_pretrained(
-        "mohammedaly22/VoiceTut-TTS"
-    )
-
-    print("Model loaded.")
-
-    text = "ازيك يا باشا، عامل ايه؟ النهارده الجو حلو اوي."
-
-    print(f"Generating speech for:\n{text}")
-
-    tts.synthesize(
-        text,
-        speaker="Mohamed",
-        output="test_egyptian.wav"
-    )
-
-    print("Done!")
-    print("Audio saved as: test_egyptian.wav")
+TEXT = "أهلاً بيك، معاك قسم الموارد البشرية من GB corp. ممكن أعرف اسمك بالكامل؟"
 
 
-if __name__ == "__main__":
-    main()
+print("=" * 60)
+print("VoiceTut CPU Test")
+print("=" * 60)
+
+print("\n[1] Loading model...")
+
+start = time.perf_counter()
+
+tts = VoiceTutTTS.from_pretrained(MODEL)
+
+load_time = time.perf_counter() - start
+
+print(f"Model loading time: {load_time:.2f}s")
+
+
+print("\n[2] Generating speech...")
+
+start = time.perf_counter()
+
+tts.synthesize(
+    TEXT,
+    speaker="Mohamed",
+    num_step=32,
+    output="tests/voicetut_test.wav",
+)
+
+generation_time = time.perf_counter() - start
+
+print(f"Generation time: {generation_time:.2f}s")
+
+
+print("\n[3] Done!")
+print("Output: tests/voicetut_test.wav")
+print(f"Generation time: {generation_time:.2f}s")

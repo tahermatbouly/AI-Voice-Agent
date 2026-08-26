@@ -1,100 +1,485 @@
 """
-Wraps faster-whisper as a LiveKit Agents STT plugin.
+Local Faster-Whisper STT plugin for LiveKit Agents 1.6.10.
 
-IMPORTANT: faster-whisper does not support streaming input -- it needs a
-complete utterance's audio before it can transcribe. This plugin
-implements LiveKit's standard non-streaming STT interface
-(_recognize_impl). To actually use it inside an AgentSession, it must be
-wrapped with LiveKit's StreamAdapter + a VAD instance -- that wrapping
-happens in worker.py, not here:
+Pipeline:
 
-    from livekit.agents import stt as stt_module
-    from livekit.plugins import silero
+    LiveKit AudioFrame
+          ↓
+    AudioBuffer
+          ↓
+    PCM int16
+          ↓
+    mono float32
+          ↓
+    16 kHz
+          ↓
+    Faster-Whisper
+          ↓
+    Arabic transcript
 
-    whisper_stt = WhisperSTT()
-    session_stt = stt_module.StreamAdapter(
-        stt=whisper_stt,
-        vad=silero.VAD.load(),
-    )
-
-This file only defines the plugin itself -- the actual transcription
-logic, reusing the same faster-whisper setup from the original
-console-prototype stt.py.
-
-NOTE: livekit-agents' exact STT base-class method signature can shift
-slightly between versions. If this fails to load with an error about
-_recognize_impl's signature, check the installed version's source:
-    python -c "import livekit.agents.stt as m; import inspect; print(inspect.getsource(m.STT))"
-and adjust the signature below to match.
+CPU-only.
+No DeepFilterNet.
+No cloud STT.
+No cloud turn detector.
 """
 
+from __future__ import annotations
+
+import asyncio
+import logging
+from typing import Optional
+
+import numpy as np
 from faster_whisper import WhisperModel
 
 from livekit.agents import stt
+from livekit.agents.types import (
+    APIConnectOptions,
+    DEFAULT_API_CONNECT_OPTIONS,
+    NOT_GIVEN,
+    NotGivenOr,
+)
 from livekit.agents.utils import AudioBuffer
 
-from app import config
 
-_model: WhisperModel | None = None
-
-
-def _load_model() -> WhisperModel:
-    """Load the Whisper model once and reuse it across every call --
-    loading is slow, so this must not happen per-utterance."""
-    global _model
-    if _model is None:
-        print(f"[stt_plugin] loading faster-whisper '{config.WHISPER_MODEL_SIZE}' on {config.WHISPER_DEVICE}...")
-        _model = WhisperModel(
-            config.WHISPER_MODEL_SIZE,
-            device=config.WHISPER_DEVICE,
-            compute_type=config.WHISPER_COMPUTE_TYPE,
-        )
-        print("[stt_plugin] model loaded.")
-    return _model
+logger = logging.getLogger("stt_plugin")
 
 
-class WhisperSTT(stt.STT):
-    """LiveKit STT plugin backed by local faster-whisper.
-    Must be wrapped with stt.StreamAdapter + a VAD before use in an
-    AgentSession -- see module docstring."""
+class FasterWhisperSTT(stt.STT):
 
-    def __init__(self):
+    def __init__(
+        self,
+        model_size: str = "small",
+        device: str = "cpu",
+        compute_type: str = "int8",
+        language: str = "ar",
+        beam_size: int = 1,
+    ) -> None:
+
         super().__init__(
-            capabilities=stt.STTCapabilities(streaming=False, interim_results=False)
+            capabilities=stt.STTCapabilities(
+                streaming=False,
+                interim_results=False,
+            )
         )
+
+        self._model_size = model_size
+        self._device = device
+        self._compute_type = compute_type
+        self._language = language
+        self._beam_size = beam_size
+
+        self._model: Optional[WhisperModel] = None
+        self._load_lock = asyncio.Lock()
+
+        logger.info(
+            "[STT] configured Faster-Whisper "
+            "model=%s device=%s compute_type=%s language=%s",
+            model_size,
+            device,
+            compute_type,
+            language,
+        )
+
+    # ========================================================
+    # METADATA
+    # ========================================================
+
+    @property
+    def label(self) -> str:
+        return "faster-whisper"
+
+    @property
+    def model(self) -> str:
+        return f"faster-whisper-{self._model_size}"
+
+    @property
+    def provider(self) -> str:
+        return "local"
+
+    # ========================================================
+    # MODEL
+    # ========================================================
+
+    async def _ensure_model(self) -> None:
+
+        if self._model is not None:
+            return
+
+        async with self._load_lock:
+
+            if self._model is not None:
+                return
+
+            logger.info(
+                "[STT] loading Faster-Whisper '%s' on %s...",
+                self._model_size,
+                self._device,
+            )
+
+            self._model = await asyncio.to_thread(
+                WhisperModel,
+                self._model_size,
+                device=self._device,
+                compute_type=self._compute_type,
+            )
+
+            logger.info("[STT] Faster-Whisper model loaded.")
+
+    # ========================================================
+    # AUDIO BUFFER
+    # ========================================================
+
+    @staticmethod
+    def _audio_buffer_to_numpy(
+        buffer: AudioBuffer,
+    ) -> tuple[np.ndarray, int]:
+        """
+        Convert LiveKit AudioBuffer into:
+
+            mono float32 NumPy array
+            original sample rate
+
+        AudioBuffer in LiveKit Agents 1.6.10 is:
+
+            AudioFrame | list[AudioFrame]
+        """
+
+        logger.info(
+            "[STT] received AudioBuffer type=%s",
+            type(buffer).__name__,
+        )
+
+        # ----------------------------------------------------
+        # AudioBuffer can be:
+        #
+        #   AudioFrame
+        #   list[AudioFrame]
+        # ----------------------------------------------------
+
+        if isinstance(buffer, list):
+            frames = buffer
+
+        else:
+            frames = [buffer]
+
+        if not frames:
+            raise ValueError(
+                "[STT] AudioBuffer contains no AudioFrames."
+            )
+
+        # ----------------------------------------------------
+        # Inspect first frame
+        # ----------------------------------------------------
+
+        first_frame = frames[0]
+
+        sample_rate = first_frame.sample_rate
+        num_channels = first_frame.num_channels
+
+        logger.info(
+            "[STT] audio format: "
+            "sample_rate=%s channels=%s frames=%s",
+            sample_rate,
+            num_channels,
+            len(frames),
+        )
+
+        # ----------------------------------------------------
+        # Extract PCM from every AudioFrame
+        # ----------------------------------------------------
+
+        chunks: list[np.ndarray] = []
+
+        for index, frame in enumerate(frames):
+
+            if frame.sample_rate != sample_rate:
+                raise ValueError(
+                    "[STT] AudioFrames have different sample rates: "
+                    f"{sample_rate} vs {frame.sample_rate}"
+                )
+
+            data = np.frombuffer(
+                frame.data,
+                dtype=np.int16,
+            )
+
+            if data.size == 0:
+                continue
+
+            # ------------------------------------------------
+            # Convert interleaved multi-channel PCM to mono.
+            #
+            # Example stereo:
+            #
+            # L R L R L R
+            #
+            # becomes:
+            #
+            # (L+R)/2 ...
+            # ------------------------------------------------
+
+            if num_channels > 1:
+
+                if data.size % num_channels != 0:
+                    raise ValueError(
+                        "[STT] PCM sample count is not divisible "
+                        f"by channel count: "
+                        f"{data.size} / {num_channels}"
+                    )
+
+                data = data.reshape(
+                    -1,
+                    num_channels,
+                )
+
+                data = data.astype(
+                    np.float32
+                ).mean(axis=1)
+
+            else:
+                data = data.astype(np.float32)
+
+            chunks.append(data)
+
+        if not chunks:
+            raise ValueError(
+                "[STT] AudioBuffer contained no PCM samples."
+            )
+
+        # ----------------------------------------------------
+        # Concatenate frames
+        # ----------------------------------------------------
+
+        audio = np.concatenate(chunks)
+
+        # ----------------------------------------------------
+        # Normalize int16 → float32 [-1, 1]
+        # ----------------------------------------------------
+
+        if num_channels == 1:
+            audio = audio / 32768.0
+
+        else:
+            audio = audio / 32768.0
+
+        audio = np.asarray(
+            audio,
+            dtype=np.float32,
+        )
+
+        # ----------------------------------------------------
+        # Calculate duration
+        # ----------------------------------------------------
+
+        duration = len(audio) / sample_rate
+
+        logger.info(
+            "[STT] extracted %.3fs of audio "
+            "(%d samples @ %d Hz)",
+            duration,
+            len(audio),
+            sample_rate,
+        )
+
+        return audio, sample_rate
+
+    # ========================================================
+    # RESAMPLING
+    # ========================================================
+
+    @staticmethod
+    def _resample_to_16khz(
+        audio: np.ndarray,
+        sample_rate: int,
+    ) -> np.ndarray:
+
+        if sample_rate == 16000:
+            return audio
+
+        logger.info(
+            "[STT] resampling %d Hz -> 16000 Hz",
+            sample_rate,
+        )
+
+        import librosa
+
+        audio = librosa.resample(
+            audio,
+            orig_sr=sample_rate,
+            target_sr=16000,
+        )
+
+        return np.asarray(
+            audio,
+            dtype=np.float32,
+        )
+
+    # ========================================================
+    # RECOGNITION
+    # ========================================================
 
     async def _recognize_impl(
         self,
         buffer: AudioBuffer,
         *,
-        language: str | None = None,
-        conn_options=None,
+        language: NotGivenOr[str] = NOT_GIVEN,
+        conn_options: APIConnectOptions = DEFAULT_API_CONNECT_OPTIONS,
     ) -> stt.SpeechEvent:
-        model = _load_model()
 
-        # AudioBuffer -> a temp wav file, since faster-whisper's
-        # transcribe() expects a file path or raw samples, not LiveKit's
-        # internal buffer type directly.
-        import io
-        import wave
-
-        wav_buffer = io.BytesIO()
-        with wave.open(wav_buffer, "wb") as wf:
-            wf.setnchannels(buffer.num_channels)
-            wf.setsampwidth(2)  # 16-bit PCM
-            wf.setframerate(buffer.sample_rate)
-            wf.writeframes(buffer.data)
-        wav_buffer.seek(0)
-
-        segments, info = model.transcribe(
-            wav_buffer,
-            language=language or config.WHISPER_LANGUAGE,
-            beam_size=5,
-            vad_filter=True,
+        logger.info(
+            "[STT] ========================================"
         )
-        text = " ".join(segment.text.strip() for segment in segments).strip()
+
+        logger.info(
+            "[STT] recognize() called"
+        )
+
+        # ----------------------------------------------------
+        # Load model
+        # ----------------------------------------------------
+
+        await self._ensure_model()
+
+        if self._model is None:
+            raise RuntimeError(
+                "[STT] Faster-Whisper model failed to load."
+            )
+
+        # ----------------------------------------------------
+        # Extract audio
+        # ----------------------------------------------------
+
+        audio, sample_rate = await asyncio.to_thread(
+            self._audio_buffer_to_numpy,
+            buffer,
+        )
+
+        # ----------------------------------------------------
+        # Resample
+        # ----------------------------------------------------
+
+        audio = await asyncio.to_thread(
+            self._resample_to_16khz,
+            audio,
+            sample_rate,
+        )
+
+        audio = np.asarray(
+            audio,
+            dtype=np.float32,
+        )
+
+        duration = len(audio) / 16000.0
+
+        logger.info(
+            "[STT] final audio: %.3fs @ 16000 Hz",
+            duration,
+        )
+
+        # ----------------------------------------------------
+        # Ignore completely empty audio
+        # ----------------------------------------------------
+
+        if len(audio) == 0:
+
+            logger.warning(
+                "[STT] empty audio received"
+            )
+
+            text = ""
+
+        else:
+
+            # ------------------------------------------------
+            # Faster-Whisper inference
+            # ------------------------------------------------
+
+            logger.info(
+                "[STT] running Faster-Whisper..."
+            )
+
+            language_code = self._language
+
+            if language is not NOT_GIVEN and language:
+                language_code = str(language)
+
+            def transcribe():
+
+                segments, info = self._model.transcribe(
+                    audio,
+                    language=language_code,
+                    beam_size=self._beam_size,
+                    best_of=1,
+                    temperature=0.0,
+                    vad_filter=False,
+                    condition_on_previous_text=False,
+                    word_timestamps=False,
+                )
+
+                parts: list[str] = []
+
+                for segment in segments:
+
+                    segment_text = segment.text.strip()
+
+                    if segment_text:
+                        parts.append(segment_text)
+
+                return " ".join(parts).strip()
+
+            text = await asyncio.to_thread(
+                transcribe
+            )
+
+        # ----------------------------------------------------
+        # RESULT
+        # ----------------------------------------------------
+
+        if text:
+
+            logger.info(
+                "[STT] TRANSCRIPT: %s",
+                text,
+            )
+
+        else:
+
+            logger.warning(
+                "[STT] TRANSCRIPT: <EMPTY>"
+            )
+
+        logger.info(
+            "[STT] ========================================"
+        )
+
+        # ----------------------------------------------------
+        # Return LiveKit SpeechEvent
+        # ----------------------------------------------------
 
         return stt.SpeechEvent(
             type=stt.SpeechEventType.FINAL_TRANSCRIPT,
-            alternatives=[stt.SpeechData(text=text, language=language or config.WHISPER_LANGUAGE)],
+            alternatives=[
+                stt.SpeechData(
+                    language=language_code,
+                    text=text,
+                    confidence=1.0,
+                )
+            ],
+        )
+
+    # ========================================================
+    # CLEANUP
+    # ========================================================
+
+    async def aclose(self) -> None:
+
+        logger.info(
+            "[STT] releasing Faster-Whisper..."
+        )
+
+        self._model = None
+
+        logger.info(
+            "[STT] Faster-Whisper released."
         )

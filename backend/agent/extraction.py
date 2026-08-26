@@ -3,14 +3,17 @@ Structured HR information extraction for the AI voice agent.
 
 This module manages information extracted during a single call.
 
-The conversational LLM uses the `update_candidate_info` function tool
-whenever the caller explicitly provides relevant HR information.
+Mandatory information:
+- candidate_name
+- position
+- experience
+- current_salary
+- availability
+- notes
 
-This module is responsible only for CURRENT-CALL extraction.
-
-- extraction.py -> current call's structured information
-- memory.py     -> information remembered across calls
-- db.py         -> permanent storage after the call finishes
+Not collected:
+- contact_info
+- expected_salary
 """
 
 from typing import Optional
@@ -22,10 +25,9 @@ from app import config
 
 class CallExtraction:
     """
-    Holds the structured information extracted during one call.
+    Holds structured information extracted during one call.
 
-    A new instance must be created for every call. This prevents
-    information from one caller leaking into another caller's session.
+    A new instance must be created for every call.
     """
 
     def __init__(self):
@@ -36,30 +38,23 @@ class CallExtraction:
     def update(
         self,
         candidate_name: Optional[str] = None,
-        contact_info: Optional[str] = None,
         position: Optional[str] = None,
         experience: Optional[str] = None,
         current_salary: Optional[str] = None,
-        expected_salary: Optional[str] = None,
         availability: Optional[str] = None,
         notes: Optional[str] = None,
     ) -> None:
         """
-        Update the current call's extracted information.
+        Update information explicitly provided by the caller.
 
-        Only non-empty values are stored.
-
-        The function deliberately does not overwrite an existing value
-        with None or an empty string.
+        Empty and None values are ignored.
         """
 
         updates = {
             "candidate_name": candidate_name,
-            "contact_info": contact_info,
             "position": position,
             "experience": experience,
             "current_salary": current_salary,
-            "expected_salary": expected_salary,
             "availability": availability,
             "notes": notes,
         }
@@ -76,19 +71,12 @@ class CallExtraction:
             self.record[field] = value
 
     def get_record(self) -> dict:
-        """
-        Return a copy of the currently extracted information.
-
-        A copy is returned so callers cannot accidentally modify the
-        internal extraction state.
-        """
+        """Return the currently extracted information."""
 
         return self.record.copy()
 
     def get_missing_fields(self) -> list[str]:
-        """
-        Return the extraction fields that have not been populated yet.
-        """
+        """Return mandatory fields that are still missing."""
 
         return [
             field
@@ -109,8 +97,7 @@ class ExtractionTools:
     """
     Function tools exposed to the conversational LLM.
 
-    The LLM can call these tools during the live conversation when
-    the caller explicitly provides information.
+    The LLM calls this tool when the caller provides HR information.
     """
 
     def __init__(self, extraction: CallExtraction):
@@ -120,60 +107,32 @@ class ExtractionTools:
     async def update_candidate_info(
         self,
         context: RunContext,
-        candidate_name: Optional[str] = None,
-        contact_info: Optional[str] = None,
-        position: Optional[str] = None,
-        experience: Optional[str] = None,
-        current_salary: Optional[str] = None,
-        expected_salary: Optional[str] = None,
-        availability: Optional[str] = None,
-        notes: Optional[str] = None,
+        candidate_name: str | None = None,
+        position: str | None = None,
+        experience: str | None = None,
+        current_salary: str | None = None,
+        availability: str | None = None,
+        notes: str | None = None,
     ) -> str:
         """
         Save information explicitly provided by the caller.
 
-        IMPORTANT:
+        Rules:
         - Only save information the caller actually stated.
-        - Never guess missing information.
-        - Do not invent values.
-        - Only provide fields relevant to the latest caller message.
-        - If multiple fields were provided in one sentence, save them
-          together.
-        - Existing information should only be replaced when the caller
-          clearly provides corrected or updated information.
-
-        Examples:
-
-        Caller:
-            "أنا أحمد محمد."
-
-        Tool call:
-            candidate_name="أحمد محمد"
-
-        Caller:
-            "أنا بقدم على وظيفة مهندس صيانة وعندي 3 سنين خبرة."
-
-        Tool call:
-            position="مهندس صيانة"
-            experience="3 سنين"
-
-        Caller:
-            "مرتبي الحالي 15000 ومتوقع 20000."
-
-        Tool call:
-            current_salary="15000"
-            expected_salary="20000"
+        - Never guess or invent information.
+        - Only send fields relevant to the latest caller message.
+        - Multiple fields can be saved if the caller provides them together.
+        - Existing information can be replaced when the caller clearly
+          corrects or updates it.
         """
 
         self.extraction.update(
             candidate_name=candidate_name,
-            contact_info=contact_info,
             position=position,
             experience=experience,
             current_salary=current_salary,
-            expected_salary=expected_salary,
             availability=availability,
             notes=notes,
         )
 
-        return "Data is saved successfully."
+        return "Candidate information updated."

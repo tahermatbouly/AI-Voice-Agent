@@ -1,2 +1,64 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments
+venv/
+venv-py313-old/
+.venv/
+env/
+xtts-venv/
+voicetut-venv/
+coherex-venv/
+
+# AI models
+model/
+models/
+
+# Datasets
+data/
+
+# Audio
+*.wav
+*.mp3
+*.m4a
+*.flac
+*.ogg
+*.opus
+*.aac
+
+# Generated output
+output/
+outputs/
+generated/
+results/
+coherex_output/
+
+# Databases
+*.db
+*.sqlite
+*.sqlite3
+
+# Archives
+*.zip
+
+# Environment
 .env
-.env
+.env.*
+
+# Logs
+*.log
+logs/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db

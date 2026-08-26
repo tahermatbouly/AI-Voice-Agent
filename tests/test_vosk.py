@@ -27,7 +27,10 @@ import sys
 import time
 import json
 
-VOSK_MODEL_PATH = "vosk-model-ar"  # update to your unzipped model's folder name
+VOSK_MODEL_PATH = os.getenv(
+    "VOSK_MODEL_PATH",
+    "models/vosk-model-ar-mgb2-0.4",
+)  # update to your unzipped model's folder name
 SAMPLE_RATE = 16000
 
 RECORD_MODE = True

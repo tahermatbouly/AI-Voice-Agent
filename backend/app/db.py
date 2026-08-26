@@ -37,8 +37,12 @@ class Call(Base):
     # HR extraction fields -- must stay in sync with config.EXTRACTION_FIELDS
     candidate_name = Column(String, default="")
     contact_info = Column(String, default="")
+    military_service = Column(String, default="")
+    education = Column(String, default="")
     position = Column(String, default="")
     experience = Column(Text, default="")
+    years_of_experience = Column(String, default="")
+    location = Column(String, default="")
     current_salary = Column(String, default="")
     expected_salary = Column(String, default="")
     availability = Column(String, default="")
@@ -73,6 +77,7 @@ def save_call(
             contact_info=record.get("contact_info", ""),
             position=record.get("position", ""),
             experience=record.get("experience", ""),
+            years_of_experience=record.get("years_of_experience", ""),
             current_salary=record.get("current_salary", ""),
             expected_salary=record.get("expected_salary", ""),
             availability=record.get("availability", ""),

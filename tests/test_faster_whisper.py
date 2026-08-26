@@ -40,7 +40,7 @@ WHISPER_LANGUAGE = "ar"
 # Fill these in with paths to real .wav files of Egyptian Arabic speech.
 # Leave empty and use --record mode instead if you don't have files yet.
 TEST_AUDIO_FILES = [
-    # "samples/sample1.wav",
+    "samples/egyptian_test.wav",
     # "samples/sample2.wav",
 ]
 
@@ -135,9 +135,13 @@ def run_tests(model, audio_files):
         try:
             segments, info = model.transcribe(
                 path,
-                language=WHISPER_LANGUAGE,
+                language="ar",
+                task="transcribe",
                 beam_size=5,
+                best_of=5,
+                temperature=0.0,
                 vad_filter=True,
+                condition_on_previous_text=True,
             )
             text = " ".join(segment.text.strip() for segment in segments).strip()
             elapsed = time.time() - t0
