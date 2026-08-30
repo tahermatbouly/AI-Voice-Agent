@@ -1,5 +1,5 @@
 """
-Local Faster-Whisper STT plugin for LiveKit Agents 1.6.10.
+Cohere Transcribe Arabic STT plugin for LiveKit Agents 1.6.10.
 
 Pipeline:
 
@@ -13,24 +13,33 @@ Pipeline:
           ↓
     16 kHz
           ↓
-    Faster-Whisper
+    temporary WAV
+          ↓
+    Cohere Transcribe Arabic
           ↓
     Arabic transcript
+          ↓
+    LiveKit SpeechEvent
 
-CPU-only.
-No DeepFilterNet.
-No cloud STT.
-No cloud turn detector.
+Cloud STT:
+    Cohere Transcribe Arabic
+
+Model:
+    cohere-transcribe-arabic-07-2026
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
+import tempfile
+import wave
+from pathlib import Path
 from typing import Optional
 
+import cohere
+import librosa
 import numpy as np
-from faster_whisper import WhisperModel
 
 from livekit.agents import stt
 from livekit.agents.types import (
@@ -41,19 +50,20 @@ from livekit.agents.types import (
 )
 from livekit.agents.utils import AudioBuffer
 
+from app import config
 
-logger = logging.getLogger("stt_plugin")
+
+logger = logging.getLogger("cohere_stt")
 
 
-class FasterWhisperSTT(stt.STT):
+class CohereArabicSTT(stt.STT):
 
     def __init__(
         self,
-        model_size: str = "small",
-        device: str = "cpu",
-        compute_type: str = "int8",
+        api_key: Optional[str] = None,
+        model: str = "cohere-transcribe-arabic-07-2026",
         language: str = "ar",
-        beam_size: int = 1,
+        sample_rate: int = 16000,
     ) -> None:
 
         super().__init__(
@@ -63,22 +73,26 @@ class FasterWhisperSTT(stt.STT):
             )
         )
 
-        self._model_size = model_size
-        self._device = device
-        self._compute_type = compute_type
+        self._api_key = api_key or config.COHERE_API_KEY
+        self._model = model
         self._language = language
-        self._beam_size = beam_size
+        self._sample_rate = sample_rate
 
-        self._model: Optional[WhisperModel] = None
-        self._load_lock = asyncio.Lock()
+        if not self._api_key:
+            raise RuntimeError(
+                "COHERE_API_KEY is not set."
+            )
+
+        self._client = cohere.ClientV2(
+            api_key=self._api_key
+        )
 
         logger.info(
-            "[STT] configured Faster-Whisper "
-            "model=%s device=%s compute_type=%s language=%s",
-            model_size,
-            device,
-            compute_type,
-            language,
+            "[STT] Cohere configured "
+            "model=%s language=%s sample_rate=%s",
+            self._model,
+            self._language,
+            self._sample_rate,
         )
 
     # ========================================================
@@ -87,44 +101,15 @@ class FasterWhisperSTT(stt.STT):
 
     @property
     def label(self) -> str:
-        return "faster-whisper"
+        return "cohere-transcribe"
 
     @property
     def model(self) -> str:
-        return f"faster-whisper-{self._model_size}"
+        return self._model
 
     @property
     def provider(self) -> str:
-        return "local"
-
-    # ========================================================
-    # MODEL
-    # ========================================================
-
-    async def _ensure_model(self) -> None:
-
-        if self._model is not None:
-            return
-
-        async with self._load_lock:
-
-            if self._model is not None:
-                return
-
-            logger.info(
-                "[STT] loading Faster-Whisper '%s' on %s...",
-                self._model_size,
-                self._device,
-            )
-
-            self._model = await asyncio.to_thread(
-                WhisperModel,
-                self._model_size,
-                device=self._device,
-                compute_type=self._compute_type,
-            )
-
-            logger.info("[STT] Faster-Whisper model loaded.")
+        return "cohere"
 
     # ========================================================
     # AUDIO BUFFER
@@ -134,32 +119,14 @@ class FasterWhisperSTT(stt.STT):
     def _audio_buffer_to_numpy(
         buffer: AudioBuffer,
     ) -> tuple[np.ndarray, int]:
-        """
-        Convert LiveKit AudioBuffer into:
-
-            mono float32 NumPy array
-            original sample rate
-
-        AudioBuffer in LiveKit Agents 1.6.10 is:
-
-            AudioFrame | list[AudioFrame]
-        """
 
         logger.info(
             "[STT] received AudioBuffer type=%s",
             type(buffer).__name__,
         )
 
-        # ----------------------------------------------------
-        # AudioBuffer can be:
-        #
-        #   AudioFrame
-        #   list[AudioFrame]
-        # ----------------------------------------------------
-
         if isinstance(buffer, list):
             frames = buffer
-
         else:
             frames = [buffer]
 
@@ -168,35 +135,27 @@ class FasterWhisperSTT(stt.STT):
                 "[STT] AudioBuffer contains no AudioFrames."
             )
 
-        # ----------------------------------------------------
-        # Inspect first frame
-        # ----------------------------------------------------
-
         first_frame = frames[0]
 
         sample_rate = first_frame.sample_rate
         num_channels = first_frame.num_channels
 
         logger.info(
-            "[STT] audio format: "
+            "[STT] input audio: "
             "sample_rate=%s channels=%s frames=%s",
             sample_rate,
             num_channels,
             len(frames),
         )
 
-        # ----------------------------------------------------
-        # Extract PCM from every AudioFrame
-        # ----------------------------------------------------
-
         chunks: list[np.ndarray] = []
 
-        for index, frame in enumerate(frames):
+        for frame in frames:
 
             if frame.sample_rate != sample_rate:
                 raise ValueError(
-                    "[STT] AudioFrames have different sample rates: "
-                    f"{sample_rate} vs {frame.sample_rate}"
+                    "[STT] AudioFrames have different "
+                    "sample rates."
                 )
 
             data = np.frombuffer(
@@ -208,24 +167,15 @@ class FasterWhisperSTT(stt.STT):
                 continue
 
             # ------------------------------------------------
-            # Convert interleaved multi-channel PCM to mono.
-            #
-            # Example stereo:
-            #
-            # L R L R L R
-            #
-            # becomes:
-            #
-            # (L+R)/2 ...
+            # Convert stereo/multichannel → mono
             # ------------------------------------------------
 
             if num_channels > 1:
 
                 if data.size % num_channels != 0:
                     raise ValueError(
-                        "[STT] PCM sample count is not divisible "
-                        f"by channel count: "
-                        f"{data.size} / {num_channels}"
+                        "[STT] PCM sample count is not "
+                        "divisible by channel count."
                     )
 
                 data = data.reshape(
@@ -238,47 +188,33 @@ class FasterWhisperSTT(stt.STT):
                 ).mean(axis=1)
 
             else:
-                data = data.astype(np.float32)
+
+                data = data.astype(
+                    np.float32
+                )
 
             chunks.append(data)
 
         if not chunks:
             raise ValueError(
-                "[STT] AudioBuffer contained no PCM samples."
+                "[STT] AudioBuffer contained no samples."
             )
-
-        # ----------------------------------------------------
-        # Concatenate frames
-        # ----------------------------------------------------
 
         audio = np.concatenate(chunks)
 
-        # ----------------------------------------------------
-        # Normalize int16 → float32 [-1, 1]
-        # ----------------------------------------------------
-
-        if num_channels == 1:
-            audio = audio / 32768.0
-
-        else:
-            audio = audio / 32768.0
+        # int16 → float32
+        audio = audio / 32768.0
 
         audio = np.asarray(
             audio,
             dtype=np.float32,
         )
 
-        # ----------------------------------------------------
-        # Calculate duration
-        # ----------------------------------------------------
-
         duration = len(audio) / sample_rate
 
         logger.info(
-            "[STT] extracted %.3fs of audio "
-            "(%d samples @ %d Hz)",
+            "[STT] extracted %.3fs @ %d Hz",
             duration,
-            len(audio),
             sample_rate,
         )
 
@@ -302,8 +238,6 @@ class FasterWhisperSTT(stt.STT):
             sample_rate,
         )
 
-        import librosa
-
         audio = librosa.resample(
             audio,
             orig_sr=sample_rate,
@@ -314,6 +248,93 @@ class FasterWhisperSTT(stt.STT):
             audio,
             dtype=np.float32,
         )
+
+    # ========================================================
+    # WAV CREATION
+    # ========================================================
+
+    @staticmethod
+    def _write_wav(
+        audio: np.ndarray,
+        path: str,
+        sample_rate: int = 16000,
+    ) -> None:
+
+        # float32 [-1, 1] → int16
+        audio_int16 = np.clip(
+            audio * 32768.0,
+            -32768,
+            32767,
+        ).astype(np.int16)
+
+        with wave.open(path, "wb") as wav:
+
+            wav.setnchannels(1)
+            wav.setsampwidth(2)
+            wav.setframerate(sample_rate)
+
+            wav.writeframes(
+                audio_int16.tobytes()
+            )
+
+    # ========================================================
+    # COHERE TRANSCRIPTION
+    # ========================================================
+
+    async def _transcribe_with_cohere(
+        self,
+        wav_path: str,
+    ) -> str:
+
+        logger.info(
+            "[STT] Sending audio to Cohere..."
+        )
+
+        logger.info(
+            "[STT] model=%s language=%s file=%s",
+            self._model,
+            self._language,
+            wav_path,
+        )
+
+        def transcribe():
+
+            with open(
+                wav_path,
+                "rb",
+            ) as audio_file:
+
+                response = self._client.audio.transcriptions.create(
+                    model=self._model,
+                    language=self._language,
+                    file=audio_file,
+                )
+
+            return response.text.strip()
+
+        try:
+
+            text = await asyncio.to_thread(
+                transcribe
+            )
+
+        except Exception as e:
+
+            logger.error(
+                "[STT] Cohere transcription failed: "
+                "%s: %s",
+                type(e).__name__,
+                e,
+            )
+
+            raise
+
+        logger.info(
+            "[STT] Cohere transcript: %s",
+            text if text else "<EMPTY>",
+        )
+
+        return text
 
     # ========================================================
     # RECOGNITION
@@ -332,22 +353,11 @@ class FasterWhisperSTT(stt.STT):
         )
 
         logger.info(
-            "[STT] recognize() called"
+            "[STT] Cohere recognize() called"
         )
 
         # ----------------------------------------------------
-        # Load model
-        # ----------------------------------------------------
-
-        await self._ensure_model()
-
-        if self._model is None:
-            raise RuntimeError(
-                "[STT] Faster-Whisper model failed to load."
-            )
-
-        # ----------------------------------------------------
-        # Extract audio
+        # Extract LiveKit audio
         # ----------------------------------------------------
 
         audio, sample_rate = await asyncio.to_thread(
@@ -356,7 +366,7 @@ class FasterWhisperSTT(stt.STT):
         )
 
         # ----------------------------------------------------
-        # Resample
+        # Resample to 16 kHz
         # ----------------------------------------------------
 
         audio = await asyncio.to_thread(
@@ -378,7 +388,7 @@ class FasterWhisperSTT(stt.STT):
         )
 
         # ----------------------------------------------------
-        # Ignore completely empty audio
+        # Empty audio
         # ----------------------------------------------------
 
         if len(audio) == 0:
@@ -392,48 +402,69 @@ class FasterWhisperSTT(stt.STT):
         else:
 
             # ------------------------------------------------
-            # Faster-Whisper inference
+            # Create temporary WAV
             # ------------------------------------------------
 
-            logger.info(
-                "[STT] running Faster-Whisper..."
-            )
+            with tempfile.NamedTemporaryFile(
+                suffix=".wav",
+                delete=False,
+            ) as temp_file:
 
-            language_code = self._language
+                wav_path = temp_file.name
 
-            if language is not NOT_GIVEN and language:
-                language_code = str(language)
+            try:
 
-            def transcribe():
-
-                segments, info = self._model.transcribe(
+                await asyncio.to_thread(
+                    self._write_wav,
                     audio,
-                    language=language_code,
-                    beam_size=self._beam_size,
-                    best_of=1,
-                    temperature=0.0,
-                    vad_filter=False,
-                    condition_on_previous_text=False,
-                    word_timestamps=False,
+                    wav_path,
+                    16000,
                 )
 
-                parts: list[str] = []
+                file_size = Path(
+                    wav_path
+                ).stat().st_size
 
-                for segment in segments:
+                logger.info(
+                    "[STT] WAV created: "
+                    "%s bytes",
+                    file_size,
+                )
 
-                    segment_text = segment.text.strip()
+                # ------------------------------------------------
+                # Cohere
+                # ------------------------------------------------
 
-                    if segment_text:
-                        parts.append(segment_text)
+                text = await self._transcribe_with_cohere(
+                    wav_path
+                )
 
-                return " ".join(parts).strip()
+            finally:
 
-            text = await asyncio.to_thread(
-                transcribe
-            )
+                try:
+                    Path(wav_path).unlink(
+                        missing_ok=True
+                    )
+
+                except Exception as e:
+
+                    logger.warning(
+                        "[STT] Failed to remove "
+                        "temporary WAV: %s",
+                        e,
+                    )
 
         # ----------------------------------------------------
-        # RESULT
+        # Language
+        # ----------------------------------------------------
+
+        language_code = self._language
+
+        if language is not NOT_GIVEN and language:
+            language_code = str(language)
+
+        # ----------------------------------------------------
+        # Result
         # ----------------------------------------------------
 
         if text:
@@ -453,10 +484,6 @@ class FasterWhisperSTT(stt.STT):
             "[STT] ========================================"
         )
 
-        # ----------------------------------------------------
-        # Return LiveKit SpeechEvent
-        # ----------------------------------------------------
-
         return stt.SpeechEvent(
             type=stt.SpeechEventType.FINAL_TRANSCRIPT,
             alternatives=[
@@ -475,11 +502,11 @@ class FasterWhisperSTT(stt.STT):
     async def aclose(self) -> None:
 
         logger.info(
-            "[STT] releasing Faster-Whisper..."
+            "[STT] closing Cohere STT..."
         )
 
-        self._model = None
+        self._client = None
 
         logger.info(
-            "[STT] Faster-Whisper released."
+            "[STT] Cohere STT closed."
         )

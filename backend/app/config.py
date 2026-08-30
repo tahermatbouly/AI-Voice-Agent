@@ -8,35 +8,31 @@ load_dotenv(BASE_DIR / ".env")
 
 
 # ============================================================
-# STT
+# STT - COHERE
 # ============================================================
 
-WHISPER_LANGUAGE = "ar"
-WHISPER_MODEL_SIZE = "small"
-WHISPER_DEVICE = "cpu"
-WHISPER_COMPUTE_TYPE = "int8"
+COHERE_API_KEY = os.getenv("COHERE_API_KEY")
 
+COHERE_STT_MODEL = "cohere-transcribe-arabic-07-2026"
+COHERE_STT_LANGUAGE = "ar"
 
+COHERE_STT_SAMPLE_RATE = 16000
 # ============================================================
-# VOICETUT TTS
+# VOICETUT TTS API
 # ============================================================
 
-VOICETUT_MODEL = "mohammedaly22/VoiceTut-TTS"
+VOICETUT_API_URL = os.getenv(
+    "VOICETUT_API_URL",
+    "https://entered-educated-breaking-commission.trycloudflare.com"
+)
 
-# Built-in Egyptian Arabic voice.
-# Built-in speakers avoid the extra reference-audio step.
 VOICETUT_SPEAKER = "Mohamed"
 
-# Lower steps = faster generation.
-# 32 is a good starting point for quality/speed.
-VOICETUT_NUM_STEPS = 32
-
-# Keep sentences short for faster generation.
 VOICETUT_MAX_TEXT_LENGTH = 120
 
 VOICETUT_SAMPLE_RATE = 24000
 
-
+VOICETUT_API_TIMEOUT = 60
 # ============================================================
 # GROQ LLM
 # ============================================================
@@ -163,3 +159,6 @@ SYSTEM_PROMPT = """
 def validate_config():
     if not GROQ_API_KEY:
         raise RuntimeError("GROQ_API_KEY is not set.")
+
+    if not COHERE_API_KEY:
+        raise RuntimeError("COHERE_API_KEY is not set.")

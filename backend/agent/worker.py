@@ -47,7 +47,7 @@ from livekit.agents import (
 
 from livekit.plugins import groq, silero
 
-from agent.stt_plugin import FasterWhisperSTT
+from agent.stt_plugin import CohereArabicSTT
 from agent.tts_plugin import build_tts
 from app import config
 
@@ -56,7 +56,12 @@ load_dotenv()
 
 logging.basicConfig(level=logging.INFO)
 
+logging.getLogger("numba").setLevel(logging.WARNING)
+logging.getLogger("numba.core").setLevel(logging.WARNING)
+logging.getLogger("livekit").setLevel(logging.INFO)
+
 logger = logging.getLogger("voice-agent")
+
 
 
 # ============================================================
@@ -91,29 +96,29 @@ async def entrypoint(ctx: JobContext):
     # --------------------------------------------------------
 
     logger.info(
-        "[STT] Loading Faster-Whisper '%s'...",
-        config.WHISPER_MODEL_SIZE,
+        "[STT] Loading Cohere Transcribe Arabic..."
     )
 
-    stt = FasterWhisperSTT(
-        model_size=config.WHISPER_MODEL_SIZE,
-        device=config.WHISPER_DEVICE,
-        compute_type=config.WHISPER_COMPUTE_TYPE,
-        language=config.WHISPER_LANGUAGE,
-        beam_size=1,
+    stt = CohereArabicSTT(
+        api_key=config.COHERE_API_KEY,
+        model=config.COHERE_STT_MODEL,
+        language=config.COHERE_STT_LANGUAGE,
+        sample_rate=config.COHERE_STT_SAMPLE_RATE,
     )
 
-    logger.info("[STT] Ready.")
-
+    logger.info("[STT] Cohere STT Ready.")
     # --------------------------------------------------------
     # TTS
     # --------------------------------------------------------
 
-    logger.info("[TTS] Loading VoiceTut-TTS...")
+    logger.info(
+    "[TTS] Connecting to VoiceTut API: %s",
+        config.VOICETUT_API_URL,
+    )
 
     tts = build_tts()
 
-    logger.info("[TTS] Ready.")
+    logger.info("[TTS] VoiceTut API ready.")
 
     # --------------------------------------------------------
     # LLM
