@@ -5,27 +5,35 @@
     "is_welcome": true
   },
   {
-    "id": "q1_domain_role",
+    "id": "q1_name",
+    "question_ar": "ممكن أعرف اسم حضرتك بالكامل؟",
+    "target_field": "candidate_name"
+  },
+  {
+    "id": "q2_domain",
     "question_ar": "إيه المجال أو الشغلانة اللي بتدور عليها؟",
     "target_field": "target_domain"
   },
   {
-    "id": "q2_experience",
+    "id": "q3_experience",
     "question_ar": "عندك كام سنة خبرة في المجال ده؟",
     "target_field": "years_of_experience"
   },
   {
-    "id": "q3_education",
+    "id": "q4_education",
     "question_ar": "إيه مؤهلك الدراسي أو أعلى شهادة معاك؟",
     "target_field": "education_level"
   },
   {
-    "id": "q4_skills_tools",
+    "id": "q5_skills_tools",
     "question_ar": "إيه أهم المهارات والبرامج أو الأدوات اللي بتستخدمها باستمرار؟",
-    "target_fields": ["key_skills", "tools_technologies"]
+    "target_fields": [
+      "key_skills",
+      "tools_technologies"
+    ]
   },
   {
-    "id": "q5_language",
+    "id": "q6_english",
     "question_ar": "مستواك إيه في الإنجليزي، خصوصًا في القراءة والكتابة؟",
     "target_field": "english_proficiency"
   }

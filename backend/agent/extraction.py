@@ -1,65 +1,94 @@
 """
-Structured HR information extraction for the AI voice agent.
+Structured candidate information extraction.
 
-This module manages information extracted during a single call.
+Canonical candidate schema:
 
-Mandatory information:
-- candidate_name
-- position
-- experience
-- current_salary
-- availability
-- notes
+    candidate_name
+    target_domain
+    years_of_experience
+    education_level
+    key_skills
+    tools_technologies
+    english_proficiency
+    notes
 
-Not collected:
-- contact_info
-- expected_salary
+The same schema is used by:
+    - CallExtraction
+    - ExtractionTools
+    - QuestionManager
+    - final candidate record
 """
+
+from __future__ import annotations
 
 from typing import Optional
 
 from livekit.agents import RunContext, function_tool
 
-from app import config
 
+# ============================================================
+# CANONICAL FIELDS
+# ============================================================
+
+EXTRACTION_FIELDS = (
+    "candidate_name",
+    "target_domain",
+    "years_of_experience",
+    "education_level",
+    "key_skills",
+    "tools_technologies",
+    "english_proficiency",
+    "notes",
+)
+
+
+# ============================================================
+# CALL EXTRACTION
+# ============================================================
 
 class CallExtraction:
     """
-    Holds structured information extracted during one call.
+    Holds structured information for one call.
 
-    A new instance must be created for every call.
+    Create one instance for every call.
     """
 
-    def __init__(self):
-        self.record = {
-            field: "" for field in config.EXTRACTION_FIELDS
+    def __init__(self) -> None:
+
+        self.record: dict[str, str] = {
+            field: ""
+            for field in EXTRACTION_FIELDS
         }
+
+    # --------------------------------------------------------
+    # UPDATE
+    # --------------------------------------------------------
 
     def update(
         self,
         candidate_name: Optional[str] = None,
-        position: Optional[str] = None,
-        experience: Optional[str] = None,
-        current_salary: Optional[str] = None,
-        availability: Optional[str] = None,
+        target_domain: Optional[str] = None,
+        years_of_experience: Optional[str] = None,
+        education_level: Optional[str] = None,
+        key_skills: Optional[str] = None,
+        tools_technologies: Optional[str] = None,
+        english_proficiency: Optional[str] = None,
         notes: Optional[str] = None,
     ) -> None:
-        """
-        Update information explicitly provided by the caller.
-
-        Empty and None values are ignored.
-        """
 
         updates = {
             "candidate_name": candidate_name,
-            "position": position,
-            "experience": experience,
-            "current_salary": current_salary,
-            "availability": availability,
+            "target_domain": target_domain,
+            "years_of_experience": years_of_experience,
+            "education_level": education_level,
+            "key_skills": key_skills,
+            "tools_technologies": tools_technologies,
+            "english_proficiency": english_proficiency,
             "notes": notes,
         }
 
         for field, value in updates.items():
+
             if value is None:
                 continue
 
@@ -70,37 +99,64 @@ class CallExtraction:
 
             self.record[field] = value
 
-    def get_record(self) -> dict:
-        """Return the currently extracted information."""
+    # --------------------------------------------------------
+    # GET RECORD
+    # --------------------------------------------------------
+
+    def get_record(self) -> dict[str, str]:
 
         return self.record.copy()
 
+    # --------------------------------------------------------
+    # GET MISSING
+    # --------------------------------------------------------
+
     def get_missing_fields(self) -> list[str]:
-        """Return mandatory fields that are still missing."""
 
         return [
             field
-            for field in config.EXTRACTION_FIELDS
-            if not self.record.get(field)
+            for field in EXTRACTION_FIELDS
+            if not self.record[field]
         ]
 
+    # --------------------------------------------------------
+    # CHECK INFORMATION
+    # --------------------------------------------------------
+
     def has_information(self) -> bool:
-        """Return True if at least one field has been extracted."""
 
         return any(
-            bool(value)
+            bool(value.strip())
             for value in self.record.values()
         )
 
+    # --------------------------------------------------------
+    # RESET
+    # --------------------------------------------------------
+
+    def reset(self) -> None:
+
+        for field in EXTRACTION_FIELDS:
+            self.record[field] = ""
+
+
+# ============================================================
+# EXTRACTION TOOLS
+# ============================================================
 
 class ExtractionTools:
     """
-    Function tools exposed to the conversational LLM.
+    Tools exposed to the conversational LLM.
 
-    The LLM calls this tool when the caller provides HR information.
+    The LLM uses update_candidate_info whenever the caller
+    explicitly provides candidate information.
     """
 
-    def __init__(self, extraction: CallExtraction):
+    def __init__(
+        self,
+        extraction: CallExtraction,
+    ) -> None:
+
         self.extraction = extraction
 
     @function_tool
@@ -108,30 +164,35 @@ class ExtractionTools:
         self,
         context: RunContext,
         candidate_name: str | None = None,
-        position: str | None = None,
-        experience: str | None = None,
-        current_salary: str | None = None,
-        availability: str | None = None,
+        target_domain: str | None = None,
+        years_of_experience: str | None = None,
+        education_level: str | None = None,
+        key_skills: str | None = None,
+        tools_technologies: str | None = None,
+        english_proficiency: str | None = None,
         notes: str | None = None,
     ) -> str:
         """
-        Save information explicitly provided by the caller.
+        Save information explicitly stated by the caller.
 
         Rules:
-        - Only save information the caller actually stated.
-        - Never guess or invent information.
-        - Only send fields relevant to the latest caller message.
-        - Multiple fields can be saved if the caller provides them together.
-        - Existing information can be replaced when the caller clearly
-          corrects or updates it.
+
+        - Only save information explicitly provided.
+        - Never guess or infer missing information.
+        - Multiple fields may be updated from one message.
+        - Only provide fields relevant to the latest message.
+        - Existing information may be replaced if the caller
+          clearly corrects it.
         """
 
         self.extraction.update(
             candidate_name=candidate_name,
-            position=position,
-            experience=experience,
-            current_salary=current_salary,
-            availability=availability,
+            target_domain=target_domain,
+            years_of_experience=years_of_experience,
+            education_level=education_level,
+            key_skills=key_skills,
+            tools_technologies=tools_technologies,
+            english_proficiency=english_proficiency,
             notes=notes,
         )
 
