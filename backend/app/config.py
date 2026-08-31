@@ -23,7 +23,7 @@ COHERE_STT_SAMPLE_RATE = 16000
 
 VOICETUT_API_URL = os.getenv(
     "VOICETUT_API_URL",
-    "https://entered-educated-breaking-commission.trycloudflare.com"
+    "https://suppose-instrument-tucson-big.trycloudflare.com"
 )
 
 VOICETUT_SPEAKER = "Mohamed"
