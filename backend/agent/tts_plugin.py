@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import asyncio
 import io
 import logging
@@ -5,28 +7,23 @@ import wave
 
 import requests
 
-from livekit.agents import tts
-
 from app import config
 
 
 logger = logging.getLogger("voice-agent.tts")
 
 
-class VoiceTut(tts.TTS):
+class VoiceTut:
 
     def __init__(self):
 
-        super().__init__(
-            capabilities=tts.TTSCapabilities(
-                streaming=False,
-            ),
-            sample_rate=config.VOICETUT_SAMPLE_RATE,
-            num_channels=1,
+        self.api_url = (
+            config.VOICETUT_API_URL.rstrip("/")
         )
 
-        self.api_url = config.VOICETUT_API_URL.rstrip("/")
-        self.speaker = config.VOICETUT_SPEAKER
+        self.speaker = (
+            config.VOICETUT_SPEAKER
+        )
 
         logger.info(
             "[TTS] VoiceTut API configured: %s",
@@ -38,107 +35,56 @@ class VoiceTut(tts.TTS):
             self.speaker,
         )
 
-    def synthesize(
-        self,
-        text,
-        *,
-        conn_options=None,
-    ):
+    # ============================================================
+    # SYNTHESIZE
+    # ============================================================
 
-        text = " ".join(text.split())
+    async def synthesize(
+        self,
+        text: str,
+    ) -> tuple[bytes, int]:
+
+        text = " ".join(
+            text.split()
+        )
 
         if not text:
-            return VoiceTutStream(
-                tts_instance=self,
-                input_text="",
-                conn_options=conn_options,
-            )
+            return b"", config.VOICETUT_SAMPLE_RATE
 
         if len(text) > config.VOICETUT_MAX_TEXT_LENGTH:
-            text = text[:config.VOICETUT_MAX_TEXT_LENGTH]
 
-        logger.info("[TTS] text: %s", text)
-
-        return VoiceTutStream(
-            tts_instance=self,
-            input_text=text,
-            conn_options=conn_options,
-        )
-
-
-class VoiceTutStream(tts.ChunkedStream):
-
-    def __init__(
-        self,
-        tts_instance,
-        input_text,
-        conn_options,
-    ):
-
-        super().__init__(
-            tts=tts_instance,
-            input_text=input_text,
-            conn_options=conn_options,
-        )
-
-        self.voicetut = tts_instance
-
-    async def _run(self, output_emitter):
-
-        if not self._input_text:
-            return
+            text = text[
+                :config.VOICETUT_MAX_TEXT_LENGTH
+            ]
 
         logger.info(
-            "[TTS] Requesting VoiceTut API: %s",
-            self._input_text,
+            "[TTS] text: %s",
+            text,
         )
 
-        loop = asyncio.get_running_loop()
+        pcm, sample_rate = await asyncio.to_thread(
+            self._generate,
+            text,
+        )
 
-        try:
+        return pcm, sample_rate
 
-            pcm, sample_rate = await loop.run_in_executor(
-                None,
-                self._generate,
-            )
+    # ============================================================
+    # API
+    # ============================================================
 
-            logger.info(
-                "[TTS] Received %d bytes at %d Hz",
-                len(pcm),
-                sample_rate,
-            )
+    def _generate(
+        self,
+        text: str,
+    ) -> tuple[bytes, int]:
 
-            output_emitter.initialize(
-                request_id="voicetut-api",
-                sample_rate=sample_rate,
-                num_channels=1,
-                mime_type="audio/pcm",
-            )
-
-            output_emitter.push(pcm)
-
-            output_emitter.flush()
-
-            logger.info(
-                "[TTS] Audio sent to LiveKit."
-            )
-
-        except Exception as e:
-
-            logger.exception(
-                "[TTS] VoiceTut API error: %s",
-                e,
-            )
-
-            raise
-
-    def _generate(self):
-
-        url = f"{self.voicetut.api_url}/tts"
+        url = (
+            f"{self.api_url}/tts"
+        )
 
         payload = {
-            "text": self._input_text,
-            "speaker": self.voicetut.speaker,
+            "text": text,
+            "speaker": self.speaker,
         }
 
         logger.info(
@@ -176,22 +122,43 @@ class VoiceTutStream(tts.ChunkedStream):
             len(response.content) / 1024,
         )
 
-        return self._parse_wav(response.content)
+        return self._parse_wav(
+            response.content
+        )
+
+    # ============================================================
+    # WAV PARSER
+    # ============================================================
 
     @staticmethod
-    def _parse_wav(data):
+    def _parse_wav(
+        data: bytes,
+    ) -> tuple[bytes, int]:
 
         with wave.open(
             io.BytesIO(data),
             "rb",
         ) as wav:
 
-            sample_rate = wav.getframerate()
-            channels = wav.getnchannels()
-            sample_width = wav.getsampwidth()
-            frame_count = wav.getnframes()
+            sample_rate = (
+                wav.getframerate()
+            )
 
-            pcm = wav.readframes(frame_count)
+            channels = (
+                wav.getnchannels()
+            )
+
+            sample_width = (
+                wav.getsampwidth()
+            )
+
+            frame_count = (
+                wav.getnframes()
+            )
+
+            pcm = wav.readframes(
+                frame_count
+            )
 
         logger.info(
             "[TTS] WAV: "
@@ -208,13 +175,52 @@ class VoiceTutStream(tts.ChunkedStream):
         if channels != 1:
 
             raise RuntimeError(
-                f"VoiceTut returned {channels} channels. "
+                f"VoiceTut returned "
+                f"{channels} channels. "
                 f"Expected mono audio."
             )
 
         return pcm, sample_rate
 
+    # ============================================================
+    # SYNTHESIZE TO WAV FILE
+    # ============================================================
 
-def build_tts():
+    async def synthesize_to_file(
+        self,
+        text: str,
+        output_path: str,
+    ) -> str:
 
-    return VoiceTut()
+        pcm, sample_rate = (
+            await self.synthesize(text)
+        )
+
+        if not pcm:
+            return output_path
+
+        def write():
+
+            with wave.open(
+                output_path,
+                "wb",
+            ) as wav:
+
+                wav.setnchannels(1)
+                wav.setsampwidth(2)
+                wav.setframerate(
+                    sample_rate
+                )
+
+                wav.writeframes(pcm)
+
+        await asyncio.to_thread(
+            write
+        )
+
+        logger.info(
+            "[TTS] Saved: %s",
+            output_path,
+        )
+
+        return output_path

@@ -115,6 +115,32 @@ class QuestionManager:
     # VALUE CHECK
     # ========================================================
 
+
+    # ========================================================
+    # TARGET FIELDS
+    # ========================================================
+
+    @staticmethod
+    def get_target_fields(
+        question: dict[str, Any],
+    ) -> list[str]:
+
+        target_field = question.get(
+            "target_field"
+        )
+
+        if target_field:
+            return [target_field]
+
+        target_fields = question.get(
+            "target_fields"
+        )
+
+        if target_fields:
+            return list(target_fields)
+
+        return []
+
     @staticmethod
     def _has_value(
         value: Any,

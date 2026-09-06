@@ -1,33 +1,3 @@
-"""
-Cohere Transcribe Arabic STT plugin for LiveKit Agents 1.6.10.
-
-Pipeline:
-
-    LiveKit AudioFrame
-          ↓
-    AudioBuffer
-          ↓
-    PCM int16
-          ↓
-    mono float32
-          ↓
-    16 kHz
-          ↓
-    temporary WAV
-          ↓
-    Cohere Transcribe Arabic
-          ↓
-    Arabic transcript
-          ↓
-    LiveKit SpeechEvent
-
-Cloud STT:
-    Cohere Transcribe Arabic
-
-Model:
-    cohere-transcribe-arabic-07-2026
-"""
-
 from __future__ import annotations
 
 import asyncio
@@ -41,22 +11,13 @@ import cohere
 import librosa
 import numpy as np
 
-from livekit.agents import stt
-from livekit.agents.types import (
-    APIConnectOptions,
-    DEFAULT_API_CONNECT_OPTIONS,
-    NOT_GIVEN,
-    NotGivenOr,
-)
-from livekit.agents.utils import AudioBuffer
-
 from app import config
 
 
 logger = logging.getLogger("cohere_stt")
 
 
-class CohereArabicSTT(stt.STT):
+class CohereArabicSTT:
 
     def __init__(
         self,
@@ -65,13 +26,6 @@ class CohereArabicSTT(stt.STT):
         language: str = "ar",
         sample_rate: int = 16000,
     ) -> None:
-
-        super().__init__(
-            capabilities=stt.STTCapabilities(
-                streaming=False,
-                interim_results=False,
-            )
-        )
 
         self._api_key = api_key or config.COHERE_API_KEY
         self._model = model
@@ -95,115 +49,64 @@ class CohereArabicSTT(stt.STT):
             self._sample_rate,
         )
 
-    # ========================================================
-    # METADATA
-    # ========================================================
-
-    @property
-    def label(self) -> str:
-        return "cohere-transcribe"
-
-    @property
-    def model(self) -> str:
-        return self._model
-
-    @property
-    def provider(self) -> str:
-        return "cohere"
-
-    # ========================================================
-    # AUDIO BUFFER
-    # ========================================================
+    # ============================================================
+    # AUDIO CONVERSION
+    # ============================================================
 
     @staticmethod
-    def _audio_buffer_to_numpy(
-        buffer: AudioBuffer,
+    def pcm_to_numpy(
+        pcm: bytes,
+        sample_rate: int,
+        num_channels: int = 1,
     ) -> tuple[np.ndarray, int]:
 
-        logger.info(
-            "[STT] received AudioBuffer type=%s",
-            type(buffer).__name__,
-        )
-
-        if isinstance(buffer, list):
-            frames = buffer
-        else:
-            frames = [buffer]
-
-        if not frames:
+        if not pcm:
             raise ValueError(
-                "[STT] AudioBuffer contains no AudioFrames."
+                "[STT] Empty PCM audio."
             )
 
-        first_frame = frames[0]
-
-        sample_rate = first_frame.sample_rate
-        num_channels = first_frame.num_channels
-
-        logger.info(
-            "[STT] input audio: "
-            "sample_rate=%s channels=%s frames=%s",
-            sample_rate,
-            num_channels,
-            len(frames),
+        audio = np.frombuffer(
+            pcm,
+            dtype=np.int16,
         )
 
-        chunks: list[np.ndarray] = []
+        if audio.size == 0:
+            raise ValueError(
+                "[STT] PCM contains no samples."
+            )
 
-        for frame in frames:
+        # --------------------------------------------------------
+        # Stereo / multichannel → mono
+        # --------------------------------------------------------
 
-            if frame.sample_rate != sample_rate:
+        if num_channels > 1:
+
+            if audio.size % num_channels != 0:
                 raise ValueError(
-                    "[STT] AudioFrames have different "
-                    "sample rates."
+                    "[STT] PCM sample count is not "
+                    "divisible by channel count."
                 )
 
-            data = np.frombuffer(
-                frame.data,
-                dtype=np.int16,
+            audio = audio.reshape(
+                -1,
+                num_channels,
             )
 
-            if data.size == 0:
-                continue
+            audio = audio.astype(
+                np.float32
+            ).mean(axis=1)
 
-            # ------------------------------------------------
-            # Convert stereo/multichannel → mono
-            # ------------------------------------------------
+        else:
 
-            if num_channels > 1:
-
-                if data.size % num_channels != 0:
-                    raise ValueError(
-                        "[STT] PCM sample count is not "
-                        "divisible by channel count."
-                    )
-
-                data = data.reshape(
-                    -1,
-                    num_channels,
-                )
-
-                data = data.astype(
-                    np.float32
-                ).mean(axis=1)
-
-            else:
-
-                data = data.astype(
-                    np.float32
-                )
-
-            chunks.append(data)
-
-        if not chunks:
-            raise ValueError(
-                "[STT] AudioBuffer contained no samples."
+            audio = audio.astype(
+                np.float32
             )
 
-        audio = np.concatenate(chunks)
-
+        # --------------------------------------------------------
         # int16 → float32
-        audio = audio / 32768.0
+        # --------------------------------------------------------
+
+        audio /= 32768.0
 
         audio = np.asarray(
             audio,
@@ -213,19 +116,19 @@ class CohereArabicSTT(stt.STT):
         duration = len(audio) / sample_rate
 
         logger.info(
-            "[STT] extracted %.3fs @ %d Hz",
+            "[STT] Received %.3fs @ %d Hz",
             duration,
             sample_rate,
         )
 
         return audio, sample_rate
 
-    # ========================================================
+    # ============================================================
     # RESAMPLING
-    # ========================================================
+    # ============================================================
 
     @staticmethod
-    def _resample_to_16khz(
+    def resample_to_16khz(
         audio: np.ndarray,
         sample_rate: int,
     ) -> np.ndarray:
@@ -234,7 +137,7 @@ class CohereArabicSTT(stt.STT):
             return audio
 
         logger.info(
-            "[STT] resampling %d Hz -> 16000 Hz",
+            "[STT] Resampling %d Hz -> 16000 Hz",
             sample_rate,
         )
 
@@ -249,18 +152,17 @@ class CohereArabicSTT(stt.STT):
             dtype=np.float32,
         )
 
-    # ========================================================
-    # WAV CREATION
-    # ========================================================
+    # ============================================================
+    # WAV
+    # ============================================================
 
     @staticmethod
-    def _write_wav(
+    def write_wav(
         audio: np.ndarray,
         path: str,
         sample_rate: int = 16000,
     ) -> None:
 
-        # float32 [-1, 1] → int16
         audio_int16 = np.clip(
             audio * 32768.0,
             -32768,
@@ -277,24 +179,17 @@ class CohereArabicSTT(stt.STT):
                 audio_int16.tobytes()
             )
 
-    # ========================================================
-    # COHERE TRANSCRIPTION
-    # ========================================================
+    # ============================================================
+    # COHERE
+    # ============================================================
 
-    async def _transcribe_with_cohere(
+    async def _transcribe_wav(
         self,
         wav_path: str,
     ) -> str:
 
         logger.info(
             "[STT] Sending audio to Cohere..."
-        )
-
-        logger.info(
-            "[STT] model=%s language=%s file=%s",
-            self._model,
-            self._language,
-            wav_path,
         )
 
         def transcribe():
@@ -304,205 +199,156 @@ class CohereArabicSTT(stt.STT):
                 "rb",
             ) as audio_file:
 
-                response = self._client.audio.transcriptions.create(
-                    model=self._model,
-                    language=self._language,
-                    file=audio_file,
+                response = (
+                    self._client
+                    .audio
+                    .transcriptions
+                    .create(
+                        model=self._model,
+                        language=self._language,
+                        file=audio_file,
+                    )
                 )
 
             return response.text.strip()
 
-        try:
-
-            text = await asyncio.to_thread(
-                transcribe
-            )
-
-        except Exception as e:
-
-            logger.error(
-                "[STT] Cohere transcription failed: "
-                "%s: %s",
-                type(e).__name__,
-                e,
-            )
-
-            raise
+        text = await asyncio.to_thread(
+            transcribe
+        )
 
         logger.info(
-            "[STT] Cohere transcript: %s",
+            "[STT] Transcript: %s",
             text if text else "<EMPTY>",
         )
 
         return text
 
-    # ========================================================
-    # RECOGNITION
-    # ========================================================
+    # ============================================================
+    # MAIN TRANSCRIBE METHOD
+    # ============================================================
 
-    async def _recognize_impl(
+    async def transcribe(
         self,
-        buffer: AudioBuffer,
-        *,
-        language: NotGivenOr[str] = NOT_GIVEN,
-        conn_options: APIConnectOptions = DEFAULT_API_CONNECT_OPTIONS,
-    ) -> stt.SpeechEvent:
+        pcm: bytes,
+        sample_rate: int,
+        num_channels: int = 1,
+    ) -> str:
 
         logger.info(
             "[STT] ========================================"
         )
 
         logger.info(
-            "[STT] Cohere recognize() called"
+            "[STT] transcribe()"
         )
 
-        # ----------------------------------------------------
-        # Extract LiveKit audio
-        # ----------------------------------------------------
+        # --------------------------------------------------------
+        # PCM → numpy
+        # --------------------------------------------------------
 
-        audio, sample_rate = await asyncio.to_thread(
-            self._audio_buffer_to_numpy,
-            buffer,
+        audio, input_sample_rate = await asyncio.to_thread(
+            self.pcm_to_numpy,
+            pcm,
+            sample_rate,
+            num_channels,
         )
 
-        # ----------------------------------------------------
-        # Resample to 16 kHz
-        # ----------------------------------------------------
+        # --------------------------------------------------------
+        # Resample
+        # --------------------------------------------------------
 
         audio = await asyncio.to_thread(
-            self._resample_to_16khz,
+            self.resample_to_16khz,
             audio,
-            sample_rate,
-        )
-
-        audio = np.asarray(
-            audio,
-            dtype=np.float32,
+            input_sample_rate,
         )
 
         duration = len(audio) / 16000.0
 
         logger.info(
-            "[STT] final audio: %.3fs @ 16000 Hz",
+            "[STT] Final audio: %.3fs @ 16000 Hz",
             duration,
         )
 
-        # ----------------------------------------------------
-        # Empty audio
-        # ----------------------------------------------------
-
         if len(audio) == 0:
+            return ""
 
-            logger.warning(
-                "[STT] empty audio received"
+        # --------------------------------------------------------
+        # Temporary WAV
+        # --------------------------------------------------------
+
+        with tempfile.NamedTemporaryFile(
+            suffix=".wav",
+            delete=False,
+        ) as temp_file:
+
+            wav_path = temp_file.name
+
+        try:
+
+            await asyncio.to_thread(
+                self.write_wav,
+                audio,
+                wav_path,
+                16000,
             )
-
-            text = ""
-
-        else:
-
-            # ------------------------------------------------
-            # Create temporary WAV
-            # ------------------------------------------------
-
-            with tempfile.NamedTemporaryFile(
-                suffix=".wav",
-                delete=False,
-            ) as temp_file:
-
-                wav_path = temp_file.name
-
-            try:
-
-                await asyncio.to_thread(
-                    self._write_wav,
-                    audio,
-                    wav_path,
-                    16000,
-                )
-
-                file_size = Path(
-                    wav_path
-                ).stat().st_size
-
-                logger.info(
-                    "[STT] WAV created: "
-                    "%s bytes",
-                    file_size,
-                )
-
-                # ------------------------------------------------
-                # Cohere
-                # ------------------------------------------------
-
-                text = await self._transcribe_with_cohere(
-                    wav_path
-                )
-
-            finally:
-
-                try:
-                    Path(wav_path).unlink(
-                        missing_ok=True
-                    )
-
-                except Exception as e:
-
-                    logger.warning(
-                        "[STT] Failed to remove "
-                        "temporary WAV: %s",
-                        e,
-                    )
-
-        # ----------------------------------------------------
-        # Language
-        # ----------------------------------------------------
-
-        language_code = self._language
-
-        if language is not NOT_GIVEN and language:
-            language_code = str(language)
-
-        # ----------------------------------------------------
-        # Result
-        # ----------------------------------------------------
-
-        if text:
 
             logger.info(
-                "[STT] TRANSCRIPT: %s",
-                text,
+                "[STT] WAV created: %s",
+                wav_path,
             )
 
-        else:
-
-            logger.warning(
-                "[STT] TRANSCRIPT: <EMPTY>"
+            text = await self._transcribe_wav(
+                wav_path
             )
 
-        logger.info(
-            "[STT] ========================================"
-        )
+            return text
 
-        return stt.SpeechEvent(
-            type=stt.SpeechEventType.FINAL_TRANSCRIPT,
-            alternatives=[
-                stt.SpeechData(
-                    language=language_code,
-                    text=text,
-                    confidence=1.0,
+        finally:
+
+            try:
+                Path(wav_path).unlink(
+                    missing_ok=True
                 )
-            ],
+
+            except Exception as e:
+
+                logger.warning(
+                    "[STT] Failed to remove "
+                    "temporary WAV: %s",
+                    e,
+                )
+
+    # ============================================================
+    # FILE TRANSCRIPTION
+    # ============================================================
+
+    async def transcribe_file(
+        self,
+        wav_path: str,
+    ) -> str:
+
+        wav_path = str(
+            Path(wav_path).resolve()
         )
 
-    # ========================================================
+        if not Path(wav_path).exists():
+            raise FileNotFoundError(
+                wav_path
+            )
+
+        return await self._transcribe_wav(
+            wav_path
+        )
+
+    # ============================================================
     # CLEANUP
-    # ========================================================
+    # ============================================================
 
     async def aclose(self) -> None:
 
         logger.info(
-            "[STT] closing Cohere STT..."
+            "[STT] Closing Cohere STT..."
         )
 
         self._client = None

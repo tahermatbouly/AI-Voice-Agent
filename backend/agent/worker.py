@@ -1,436 +1,401 @@
 
-"""
-Main AI Voice Agent worker.
-
-Pipeline:
-
-    Caller
-      |
-      v
-    LiveKit
-      |
-      v
-    Silero VAD
-      |
-      v
-    Cohere Arabic STT
-      |
-      v
-    Groq LLM
-      |
-      v
-    VoiceTut-TTS
-      |
-      v
-    LiveKit audio
-
-Interview flow:
-
-    question_manager.py
-          |
-          v
-    extraction.py
-          |
-          v
-    Structured candidate record
-
-No additional LLM call is used for question selection.
-"""
-
 from __future__ import annotations
 
+import asyncio
 import logging
 from pathlib import Path
 
-from dotenv import load_dotenv
+from agent.audio import AudioManager
+from agent.extraction import CallExtraction
+from agent.question_manager import QuestionManager
+from agent.stt_plugin import CohereArabicSTT
+from agent.tts_plugin import VoiceTut
 
-from livekit.agents import (
-    Agent,
-    AgentSession,
-    JobContext,
-    WorkerOptions,
-    cli,
+
+# ============================================================
+# LOGGING
+# ============================================================
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
 )
 
-from livekit.plugins import groq, silero
-
-from agent.stt_plugin import CohereArabicSTT
-from agent.tts_plugin import build_tts
-from agent.extraction import CallExtraction, ExtractionTools
-from agent.question_manager import QuestionManager
-
-from app import config
+logger = logging.getLogger("voice-agent.worker")
 
 
 # ============================================================
-# ENVIRONMENT
+# PATHS
 # ============================================================
 
-load_dotenv()
+BASE_DIR = Path(__file__).resolve().parent
 
-logging.basicConfig(level=logging.INFO)
-
-logging.getLogger("numba").setLevel(logging.WARNING)
-logging.getLogger("numba.core").setLevel(logging.WARNING)
-logging.getLogger("livekit").setLevel(logging.INFO)
-
-logger = logging.getLogger("voice-agent")
+QUESTIONS_PATH = BASE_DIR / "questions.json"
 
 
 # ============================================================
-# FINAL EXTRACTION
+# INTERVIEW WORKER
 # ============================================================
 
-def print_final_extraction(extraction: CallExtraction) -> None:
-    """
-    Print the final structured candidate record to the terminal.
-    """
+class InterviewWorker:
 
-    record = extraction.get_record()
+    def __init__(self) -> None:
 
-    print()
-    print("=" * 64)
-    print("                    FINAL CANDIDATE DATA")
-    print("=" * 64)
+        logger.info("========================================")
+        logger.info("[WORKER] Initializing")
+        logger.info("========================================")
 
-    fields = [
-        ("Candidate Name", "candidate_name"),
-        ("Target Domain", "target_domain"),
-        ("Years of Experience", "years_of_experience"),
-        ("Education Level", "education_level"),
-        ("Key Skills", "key_skills"),
-        ("Tools / Technologies", "tools_technologies"),
-        ("English Proficiency", "english_proficiency"),
-        ("Notes", "notes"),
-    ]
+        # ----------------------------------------------------
+        # Questions
+        # ----------------------------------------------------
 
-    for label, key in fields:
-        value = record.get(key)
-
-        if value is None or value == "":
-            value = "<not provided>"
-
-        print(f"{label:24}: {value}")
-
-    print("=" * 64)
-    print("                    INTERVIEW COMPLETE")
-    print("=" * 64)
-    print()
-
-
-# ============================================================
-# FAREWELL DETECTION
-# ============================================================
-
-def is_farewell(text: str) -> bool:
-    """
-    Detect explicit farewell phrases.
-    """
-
-    if not text:
-        return False
-
-    text = text.strip().lower()
-
-    farewell_phrases = (
-        "مع السلامة",
-        "سلام",
-        "باي",
-        "باى",
-        "باي باي",
-        "شكرا مع السلامة",
-        "شكراً مع السلامة",
-    )
-
-    return any(
-        phrase in text
-        for phrase in farewell_phrases
-    )
-
-
-# ============================================================
-# AGENT
-# ============================================================
-
-class GBCorpAgent(Agent):
-
-    def __init__(
-        self,
-        extraction: CallExtraction,
-        question_manager: QuestionManager,
-    ) -> None:
-
-        self.extraction = extraction
-        self.question_manager = question_manager
-
-        # Tools used by the LLM to save caller information.
-        self.extraction_tools = ExtractionTools(
-            extraction
+        logger.info(
+            "[WORKER] Questions file: %s",
+            QUESTIONS_PATH,
         )
 
-        super().__init__(
-            instructions=config.SYSTEM_PROMPT,
-            tools=[
-                self.extraction_tools.update_candidate_info,
-            ],
+        self.question_manager = QuestionManager(
+            QUESTIONS_PATH
         )
 
+        # ----------------------------------------------------
+        # Deterministic extraction
+        # ----------------------------------------------------
 
-# ============================================================
-# ENTRYPOINT
-# ============================================================
+        self.extraction = CallExtraction()
 
-async def entrypoint(ctx: JobContext):
+        # ----------------------------------------------------
+        # STT
+        # ----------------------------------------------------
 
-    logger.info("[LIVEKIT] Connecting...")
+        self.stt = CohereArabicSTT()
 
-    await ctx.connect()
+        # ----------------------------------------------------
+        # TTS
+        # ----------------------------------------------------
 
-    logger.info(
-        "[LIVEKIT] Connected: %s",
-        ctx.room.name,
-    )
+        self.tts = VoiceTut()
 
-    # ========================================================
-    # CALL STATE
-    # ========================================================
+        # ----------------------------------------------------
+        # Audio
+        # ----------------------------------------------------
 
-    # One extraction object per call.
-    extraction = CallExtraction()
+        self.audio = AudioManager()
 
-    # Track whether the final data has already been printed.
-    #
-    # This prevents:
-    #
-    #     interview complete -> print
-    #     shutdown -> print again
-    #
-    extraction_printed = False
+        logger.info("[WORKER] Initialization complete.")
 
     # ========================================================
-    # FINAL OUTPUT HELPER
+    # SPEAK
     # ========================================================
 
-    def print_final_once() -> None:
-        """
-        Print the final candidate data only once.
-        """
+    async def speak(self, text: str) -> None:
 
-        nonlocal extraction_printed
-
-        if extraction_printed:
+        if not text:
             return
 
-        extraction_printed = True
+        logger.info(
+            "[TTS] Speaking: %s",
+            text,
+        )
+
+        pcm, sample_rate = await self.tts.synthesize(
+            text
+        )
+
+        if not pcm:
+            logger.warning(
+                "[TTS] Empty audio returned."
+            )
+            return
+
+        await self.audio.play(
+            pcm=pcm,
+            sample_rate=sample_rate,
+            channels=1,
+        )
+
+    # ========================================================
+    # PROCESS ANSWER
+    # ========================================================
+
+    async def process_answer(
+        self,
+        question: dict,
+        transcript: str,
+    ) -> None:
+
+        transcript = transcript.strip()
+
+        if not transcript:
+
+            logger.warning(
+                "[EXTRACTION] Empty transcript."
+            )
+
+            return
+
+        target_field = question.get(
+            "target_field"
+        )
+
+        if not target_field:
+
+            logger.warning(
+                "[EXTRACTION] Question %s has no target_field.",
+                question.get("id"),
+            )
+
+            return
 
         logger.info(
-            "[CALL] Printing final candidate extraction..."
+            "[EXTRACTION] Saving %s = %s",
+            target_field,
+            transcript,
         )
 
-        print_final_extraction(extraction)
+        # ----------------------------------------------------
+        # Deterministic extraction.
+        #
+        # The current question tells us exactly which
+        # field the transcript belongs to.
+        # ----------------------------------------------------
 
-    # ========================================================
-    # QUESTION MANAGER
-    # ========================================================
+        self.extraction.update(
+            **{
+                target_field: transcript
+            }
+        )
 
-    questions_path = (
-        Path(__file__).resolve().parent / "questions.json"
-    )
-
-    question_manager = QuestionManager(
-        questions_path=questions_path
-    )
-
-    logger.info(
-        "[QUESTIONS] Question manager initialized: %s",
-        questions_path,
-    )
-
-    # ========================================================
-    # EXTRACTION
-    # ========================================================
-
-    logger.info(
-        "[CALL] Extraction initialized."
-    )
-
-    # ========================================================
-    # STT
-    # ========================================================
-
-    logger.info(
-        "[STT] Loading Cohere Transcribe Arabic..."
-    )
-
-    stt = CohereArabicSTT(
-        api_key=config.COHERE_API_KEY,
-        model=config.COHERE_STT_MODEL,
-        language=config.COHERE_STT_LANGUAGE,
-        sample_rate=config.COHERE_STT_SAMPLE_RATE,
-    )
-
-    logger.info(
-        "[STT] Cohere STT Ready."
-    )
-
-    # ========================================================
-    # TTS
-    # ========================================================
-
-    logger.info(
-        "[TTS] Connecting to VoiceTut API: %s",
-        config.VOICETUT_API_URL,
-    )
-
-    tts = build_tts()
-
-    logger.info(
-        "[TTS] VoiceTut API ready."
-    )
-
-    # ========================================================
-    # LLM
-    # ========================================================
-
-    logger.info(
-        "[LLM] Loading Groq..."
-    )
-
-    llm = groq.LLM(
-        model=config.GROQ_LLM_MODEL,
-        api_key=config.GROQ_API_KEY,
-    )
-
-    logger.info(
-        "[LLM] Ready."
-    )
-
-    # ========================================================
-    # VAD
-    # ========================================================
-
-    logger.info(
-        "[VAD] Loading Silero VAD..."
-    )
-
-    vad = silero.VAD.load(
-        min_silence_duration=0.30,
-        prefix_padding_duration=0.25,
-    )
-
-    logger.info(
-        "[VAD] Ready."
-    )
-
-    # ========================================================
-    # AGENT
-    # ========================================================
-
-    agent = GBCorpAgent(
-        extraction=extraction,
-        question_manager=question_manager,
-    )
-
-    # ========================================================
-    # SESSION
-    # ========================================================
-
-    session = AgentSession(
-        stt=stt,
-        llm=llm,
-        tts=tts,
-        vad=vad,
-
-        # Keep current behavior.
-        allow_interruptions=False,
-        preemptive_generation=False,
-    )
-
-    logger.info(
-        "[SESSION] Starting..."
-    )
-
-    await session.start(
-        room=ctx.room,
-        agent=agent,
-    )
-
-    logger.info(
-        "[SESSION] Started."
-    )
-
-    # ========================================================
-    # SHUTDOWN CALLBACK
-    # ========================================================
-
-    @ctx.add_shutdown_callback
-    async def on_shutdown(
-        reason: str | None = None,
-    ):
         logger.info(
-            "[CALL] Call ended. Reason: %s",
-            reason,
+            "[EXTRACTION] Current record: %s",
+            self.extraction.get_record(),
         )
 
-        # Always print whatever information was extracted.
-        #
-        # This covers:
-        #
-        # 1. Normal interview completion.
-        # 2. Caller hanging up early.
-        # 3. LiveKit shutting down.
-        # 4. Unexpected call termination.
-        #
-        print_final_once()
-
     # ========================================================
-    # FIRST QUESTION
+    # RUN QUESTION
     # ========================================================
 
-    first_question = question_manager.get_welcome()
+    async def run_question(
+        self,
+        question: dict,
+    ) -> None:
 
-    logger.info(
-        "[AGENT] Sending welcome message..."
-    )
-
-    await session.generate_reply(
-        instructions=(
-            "ابدأ المكالمة فورًا.\n"
-            "قل الرسالة التالية فقط، بدون إضافة أي كلام:\n\n"
-            f"{first_question}"
+        question_id = question.get(
+            "id",
+            "<unknown>",
         )
-    )
 
-    logger.info(
-        "[AGENT] Welcome message sent."
-    )
+        question_text = question.get(
+            "question_ar",
+            "",
+        )
+
+        logger.info("----------------------------------------")
+        logger.info(
+            "[QUESTION] %s",
+            question_id,
+        )
+        logger.info(
+            "[QUESTION] %s",
+            question_text,
+        )
+        logger.info("----------------------------------------")
+
+        # ----------------------------------------------------
+        # 1. TTS
+        # ----------------------------------------------------
+
+        await self.speak(
+            question_text
+        )
+
+        # ----------------------------------------------------
+        # 2. Record answer
+        # ----------------------------------------------------
+
+        # IMPORTANT:
+        #
+        # We intentionally do NOT use:
+        # - VAD
+        # - turn detection
+        # - interruption detection
+        #
+        # For now, recording has a fixed duration.
+        # ----------------------------------------------------
+
+        answer_duration = 8.0
+
+        logger.info(
+            "[AUDIO] Recording answer for %.1f seconds...",
+            answer_duration,
+        )
+
+        pcm = await self.audio.record(
+            duration=answer_duration
+        )
+
+        # ----------------------------------------------------
+        # 3. STT
+        # ----------------------------------------------------
+
+        transcript = await self.stt.transcribe(
+            pcm=pcm,
+            sample_rate=self.audio.sample_rate,
+            num_channels=self.audio.channels,
+        )
+
+        logger.info(
+            "[STT] Transcript: %s",
+            transcript if transcript else "<EMPTY>",
+        )
+
+        # ----------------------------------------------------
+        # 4. Extraction
+        # ----------------------------------------------------
+
+        await self.process_answer(
+            question=question,
+            transcript=transcript,
+        )
 
     # ========================================================
-    # DEBUG
+    # RUN INTERVIEW
     # ========================================================
 
-    print()
-    print("=" * 60)
-    print("AI VOICE AGENT READY")
-    print("=" * 60)
-    print("STT       : Cohere Arabic")
-    print("LLM       : Groq")
-    print("TTS       : VoiceTut")
-    print("VAD       : Silero")
-    print("Questions : Question Manager")
-    print("Extraction: Structured")
-    print("Listening for caller...")
-    print()
+    async def run(self) -> None:
+
+        logger.info("========================================")
+        logger.info("[INTERVIEW] Starting interview")
+        logger.info("========================================")
+
+        # ----------------------------------------------------
+        # Welcome
+        # ----------------------------------------------------
+
+        welcome = (
+            self.question_manager.get_welcome()
+        )
+
+        if welcome:
+
+            await self.speak(
+                welcome
+            )
+
+        # ----------------------------------------------------
+        # Sequential interview
+        # ----------------------------------------------------
+
+        while True:
+
+            candidate_state = (
+                self.extraction.get_record()
+            )
+
+            question = (
+                self.question_manager.get_next_question(
+                    candidate_state
+                )
+            )
+
+            # ------------------------------------------------
+            # Finished
+            # ------------------------------------------------
+
+            if question is None:
+
+                logger.info(
+                    "[INTERVIEW] All required fields collected."
+                )
+
+                break
+
+            # ------------------------------------------------
+            # Question → Answer → STT → Extraction
+            # ------------------------------------------------
+
+            await self.run_question(
+                question
+            )
+
+        # ----------------------------------------------------
+        # Closing
+        # ----------------------------------------------------
+
+        await self.speak(
+            "تمام، شكراً ليك. كده خلصنا."
+        )
+
+        # ----------------------------------------------------
+        # Final record
+        # ----------------------------------------------------
+
+        logger.info("========================================")
+        logger.info("[INTERVIEW] FINAL RECORD")
+        logger.info(
+            "%s",
+            self.extraction.get_record(),
+        )
+        logger.info("========================================")
+
+        return self.extraction.get_record()
+
+    # ========================================================
+    # SHUTDOWN
+    # ========================================================
+
+    async def shutdown(self) -> None:
+
+        logger.info(
+            "[WORKER] Shutting down..."
+        )
+
+        try:
+
+            await self.stt.aclose()
+
+        except Exception:
+
+            logger.exception(
+                "[WORKER] Failed to close STT."
+            )
+
+        logger.info(
+            "[WORKER] Shutdown complete."
+        )
 
 
 # ============================================================
-# WORKER
+# MAIN
 # ============================================================
+
+async def main() -> None:
+
+    worker = InterviewWorker()
+
+    try:
+
+        await worker.run()
+
+    except KeyboardInterrupt:
+
+        logger.info(
+            "[WORKER] Interrupted by user."
+        )
+
+    except Exception:
+
+        logger.exception(
+            "[WORKER] Fatal error."
+        )
+
+        raise
+
+    finally:
+
+        await worker.shutdown()
+
 
 if __name__ == "__main__":
 
-    cli.run_app(
-        WorkerOptions(
-            entrypoint_fnc=entrypoint,
-        )
-    )
+    asyncio.run(main())

@@ -1,7 +1,7 @@
 [
   {
     "id": "welcome",
-    "question_ar": "مساء الخير، مع حَضْرِتَكْ محمد مَسْؤُولَ التوظيف في شركة gb corp. بَعْرِضْ لحَضْرِتَكْ أَفضل فرص العمل المناسبة لِيكْ عندنا.",
+    "question_ar": "مساء الخير، مع حَضْرِتَكْ محمد مَسْؤُولَ التوظيف في شركة gb corp. بَعْرِضْ لحَضْرِتَكْ أَفضل فرص العمل المناسبة .",
     "is_welcome": true
   },
   {
@@ -27,10 +27,7 @@
   {
     "id": "q5_skills_tools",
     "question_ar": "إيه أهم المهارات والبرامج أو الأدوات اللي بتستخدمها باستمرار؟",
-    "target_fields": [
-      "key_skills",
-      "tools_technologies"
-    ]
+    "target_fields": "key_skills and technologies"
   },
   {
     "id": "q6_english",
