@@ -1,0 +1,218 @@
+import asyncio
+import json
+import queue
+import time
+
+import numpy as np
+import sounddevice as sd
+import websockets
+
+
+WS_URL = "ws://127.0.0.1:8000/ws/voice"
+
+SAMPLE_RATE = 24000
+CHANNELS = 1
+DTYPE = "int16"
+
+audio_queue = queue.Queue()
+
+mic_chunks = 0
+sent_chunks = 0
+last_mic_log = 0
+last_send_log = 0
+
+
+def audio_callback(indata, frames, time_info, status):
+    global mic_chunks
+    global last_mic_log
+
+    if status:
+        print("[MIC ERROR]", status)
+
+    audio = indata.copy().tobytes()
+
+    audio_queue.put(audio)
+
+    mic_chunks += 1
+
+    now = time.monotonic()
+
+    if now - last_mic_log >= 1:
+        print(
+            f"[MIC] Receiving audio | "
+            f"chunks={mic_chunks} | "
+            f"bytes={len(audio)}"
+        )
+        last_mic_log = now
+
+
+async def send_audio(websocket):
+    global sent_chunks
+    global last_send_log
+
+    while True:
+        audio = await asyncio.to_thread(
+            audio_queue.get
+        )
+
+        await websocket.send(audio)
+
+        sent_chunks += 1
+
+        now = time.monotonic()
+
+        if now - last_send_log >= 1:
+            print(
+                f"[WS] Sending microphone audio | "
+                f"chunks={sent_chunks} | "
+                f"bytes={len(audio)}"
+            )
+            last_send_log = now
+
+
+async def play_tts_audio(
+    audio_bytes: bytes,
+    sample_rate: int,
+):
+    print(
+        f"[TTS] Starting playback at "
+        f"{sample_rate} Hz"
+    )
+
+    print(
+        f"[TTS] Playing "
+        f"{len(audio_bytes)} bytes at "
+        f"{sample_rate} Hz"
+    )
+
+    audio = np.frombuffer(
+        audio_bytes,
+        dtype=np.int16,
+    )
+
+    await asyncio.to_thread(
+        sd.play,
+        audio,
+        samplerate=sample_rate,
+    )
+
+    await asyncio.to_thread(
+        sd.wait,
+    )
+
+    print("[TTS] Playback finished")
+
+
+async def receive_messages(websocket):
+    tts_sample_rate = SAMPLE_RATE
+
+    while True:
+        message = await websocket.recv()
+
+        if isinstance(message, str):
+
+            print()
+            print("[SERVER]", message)
+            print()
+
+            try:
+                data = json.loads(message)
+
+                message_type = data.get("type")
+
+                if message_type == "tts_start":
+                    tts_sample_rate = data.get(
+                        "sample_rate",
+                        SAMPLE_RATE,
+                    )
+
+                    print(
+                        f"[TTS] Sample rate: "
+                        f"{tts_sample_rate} Hz"
+                    )
+
+                elif message_type == "tts_end":
+                    print(
+                        "[TTS] Server finished sending audio"
+                    )
+
+            except Exception:
+                pass
+
+        elif isinstance(message, bytes):
+
+            await play_tts_audio(
+                message,
+                tts_sample_rate,
+            )
+
+
+async def main():
+
+    print("Connecting to server...")
+
+    print()
+    print("[AUDIO] Default devices:")
+    print(sd.query_devices())
+    print()
+
+    async with websockets.connect(
+        WS_URL,
+        ping_interval=20,
+        ping_timeout=120,
+    ) as websocket:
+
+        print("Connected!")
+
+        print()
+        print(
+            f"[MIC] Opening microphone at "
+            f"{SAMPLE_RATE} Hz..."
+        )
+
+        with sd.InputStream(
+            samplerate=SAMPLE_RATE,
+            channels=CHANNELS,
+            dtype=DTYPE,
+            callback=audio_callback,
+            blocksize=960,
+        ):
+
+            print()
+            print("=" * 50)
+            print("MICROPHONE ACTIVE")
+            print("Speak normally.")
+            print("Press Ctrl+C to stop.")
+            print("=" * 50)
+            print()
+
+            sender = asyncio.create_task(
+                send_audio(websocket)
+            )
+
+            receiver = asyncio.create_task(
+                receive_messages(websocket)
+            )
+
+            try:
+                await asyncio.gather(
+                    sender,
+                    receiver,
+                )
+
+            except asyncio.CancelledError:
+                pass
+
+            finally:
+                sender.cancel()
+                receiver.cancel()
+
+
+if __name__ == "__main__":
+
+    try:
+        asyncio.run(main())
+
+    except KeyboardInterrupt:
+        print()
+        print("Stopped.")
