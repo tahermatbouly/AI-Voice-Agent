@@ -1,4 +1,3 @@
-
 import logging
 
 from fastapi import WebSocket, WebSocketDisconnect
@@ -7,7 +6,7 @@ from Backend.audio.audio_utils import (
     TARGET_SAMPLE_RATE,
     float32_to_pcm16,
     pcm16_to_float32,
-    resample_audio,
+    StreamResampler,
 )
 from Backend.audio.buffer import AudioBuffer
 from Backend.audio.vad import VoiceActivityDetector
@@ -45,6 +44,15 @@ async def websocket_endpoint(
     stt = CohereArabicSTT()
 
     tts = VoiceTutTTS()
+
+    # Stateful — carries a small sample tail across chunks so
+    # resampling doesn't introduce a discontinuity at every chunk
+    # boundary. One per connection; do NOT reset this on
+    # speech_start/speech_end, only if the whole session is rebuilt.
+    resampler = StreamResampler(
+        source_rate=INPUT_SAMPLE_RATE,
+        target_rate=TARGET_SAMPLE_RATE,
+    )
 
     interview_manager = InterviewManager(
         QUESTIONS_PATH
@@ -268,15 +276,19 @@ async def websocket_endpoint(
             # =================================================
             # NORMALIZE AUDIO
             # =================================================
+            # Use the stateful StreamResampler here, not the one-shot
+            # resample_audio() — this runs per incoming chunk, and a
+            # stateless resample per chunk introduces a discontinuity
+            # at every chunk boundary. resample_audio() is still the
+            # right call for one-shot buffers (e.g. inside stt_plugin,
+            # which resamples a whole finished utterance at once).
 
             audio = pcm16_to_float32(
                 audio_data
             )
 
-            audio = resample_audio(
-                audio,
-                source_rate=INPUT_SAMPLE_RATE,
-                target_rate=TARGET_SAMPLE_RATE,
+            audio = resampler.process(
+                audio
             )
 
             normalized_audio = float32_to_pcm16(
@@ -291,11 +303,12 @@ async def websocket_endpoint(
                 normalized_audio
             )
 
-            for event in vad_events:
+            # -------------------------------------------------
+            # Handle speech_start first so a fresh buffer is ready
+            # to receive this chunk below.
+            # -------------------------------------------------
 
-                # =============================================
-                # SPEECH START
-                # =============================================
+            for event in vad_events:
 
                 if event == "speech_start":
 
@@ -311,11 +324,29 @@ async def websocket_endpoint(
                         "type": "speech_started"
                     })
 
-                # =============================================
-                # SPEECH END
-                # =============================================
+            # -------------------------------------------------
+            # Append this chunk while we're "in speech" — this is
+            # what guarantees the chunk containing speech_end is
+            # included in the buffer before get_audio() is called
+            # below. (Previously this only ran AFTER the event loop,
+            # so the chunk where speech_end fired was silently
+            # dropped from the utterance.)
+            # -------------------------------------------------
 
-                elif event == "speech_end":
+            if speech_active:
+
+                audio_buffer.add(
+                    normalized_audio
+                )
+
+            # -------------------------------------------------
+            # Now handle speech_end, with this chunk already in
+            # the buffer.
+            # -------------------------------------------------
+
+            for event in vad_events:
+
+                if event == "speech_end":
 
                     logger.info(
                         "[VAD] Speech ended | Audio: %d bytes",
@@ -538,15 +569,9 @@ async def websocket_endpoint(
 
                     vad.reset()
 
-            # =================================================
-            # STORE SPEECH AUDIO
-            # =================================================
-
-            if speech_active:
-
-                audio_buffer.add(
-                    normalized_audio
-                )
+                    # Note: resampler is NOT reset here — it must
+                    # keep tracking the raw input stream continuously
+                    # regardless of speech/silence state.
 
     except WebSocketDisconnect:
 

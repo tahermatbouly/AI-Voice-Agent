@@ -14,12 +14,23 @@ SAMPLE_RATE = 24000
 CHANNELS = 1
 DTYPE = "int16"
 
+# How long to keep the mic gated after playback finishes, to absorb
+# room reverb / acoustic tail (speaker sound bouncing around the
+# room doesn't stop the instant the audio buffer ends). Tune this up
+# if you're still getting echo, down if turn-taking feels sluggish.
+TTS_TAIL_SECONDS = 0.4
+
 audio_queue = queue.Queue()
 
 mic_chunks = 0
 sent_chunks = 0
 last_mic_log = 0
 last_send_log = 0
+
+# Plain bool is fine to share between the sounddevice callback thread
+# and the asyncio loop here — CPython bool assignment is atomic, and
+# we only ever need "read the latest value", not a strict handshake.
+bot_speaking = False
 
 
 def audio_callback(indata, frames, time_info, status):
@@ -28,6 +39,13 @@ def audio_callback(indata, frames, time_info, status):
 
     if status:
         print("[MIC ERROR]", status)
+
+    if bot_speaking:
+        # Don't capture at all while the bot is talking (or during
+        # the acoustic tail after it stops) — on laptop speakers +
+        # open mic, this is what was being picked up and transcribed
+        # as if it were the candidate speaking.
+        return
 
     audio = indata.copy().tobytes()
 
@@ -74,6 +92,8 @@ async def play_tts_audio(
     audio_bytes: bytes,
     sample_rate: int,
 ):
+    global bot_speaking
+
     print(
         f"[TTS] Starting playback at "
         f"{sample_rate} Hz"
@@ -102,8 +122,18 @@ async def play_tts_audio(
 
     print("[TTS] Playback finished")
 
+    # Keep the mic gated a bit longer to cover room echo, then
+    # re-open it for the candidate to speak.
+    await asyncio.sleep(TTS_TAIL_SECONDS)
+
+    bot_speaking = False
+
+    print("[MIC] Re-armed (bot finished speaking)")
+
 
 async def receive_messages(websocket):
+    global bot_speaking
+
     tts_sample_rate = SAMPLE_RATE
 
     while True:
@@ -126,9 +156,15 @@ async def receive_messages(websocket):
                         SAMPLE_RATE,
                     )
 
+                    # Gate the mic as soon as we know audio is
+                    # coming — don't wait for the bytes to arrive,
+                    # there can be a little network delay between
+                    # this message and the actual audio.
+                    bot_speaking = True
+
                     print(
-                        f"[TTS] Sample rate: "
-                        f"{tts_sample_rate} Hz"
+                        f"[MIC] Gated (bot about to speak) | "
+                        f"sample rate: {tts_sample_rate} Hz"
                     )
 
                 elif message_type == "tts_end":
