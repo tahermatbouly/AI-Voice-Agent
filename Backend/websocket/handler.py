@@ -244,6 +244,23 @@ async def websocket_endpoint(
     speech_active = False
 
     # =====================================================
+    # MIC MUTING WHILE THE AGENT IS SPEAKING
+    # =====================================================
+    # A monotonic "unmute at" timestamp rather than a boolean flag +
+    # timer task: the main audio loop already runs on every incoming
+    # chunk regardless of what the agent is doing, so a plain
+    # time.monotonic() comparison on each chunk is enough — no
+    # separate task to schedule, track, or cancel.
+    #
+    # Starts at +inf below, i.e. "muted until told otherwise" —
+    # speak() is what pushes this forward to a real deadline once
+    # audio is actually ready, and pulls it back down on completion
+    # or failure. This means the mic is muted the instant we decide
+    # to speak (even during the brief pre-generated-audio lookup),
+    # not only once playback starts.
+    mic_muted_until = 0.0
+
+    # =====================================================
     # TTS HELPER
     # =====================================================
 
@@ -255,10 +272,27 @@ async def websocket_endpoint(
         (e.g. a question id that isn't in tts_tasks) — this keeps
         speak() working even if pre-generation and the actual
         question set ever drift apart.
+
+        Mutes the mic for the duration of this call plus the audio's
+        actual playback length, so anything the candidate says before
+        or during the question is dropped rather than transcribed.
         """
+
+        nonlocal mic_muted_until, speech_active
 
         if not text:
             return
+
+        # Mute immediately, before anything else — covers the (short)
+        # cache lookup or on-demand synthesis time too, not just
+        # actual playback. Also drop/reset any capture that might
+        # already be in progress so nothing bleeds across the
+        # boundary between "candidate was talking" and "agent starts
+        # talking".
+        mic_muted_until = float("inf")
+        speech_active = False
+        audio_buffer.clear()
+        vad.reset()
 
         task = tts_tasks.get(question_id)
 
@@ -289,6 +323,17 @@ async def websocket_endpoint(
                 sample_rate,
             )
 
+            # 16-bit mono PCM: 2 bytes per sample.
+            duration_s = len(audio) / (sample_rate * 2)
+
+            mic_muted_until = time.monotonic() + duration_s
+
+            logger.info(
+                "[TTS] Mic muted for %.2fs while playing: %s",
+                duration_s,
+                question_id,
+            )
+
             # Tell the client that TTS audio is coming
             await websocket.send_json({
                 "type": "tts_start",
@@ -312,6 +357,9 @@ async def websocket_endpoint(
             raise
 
         except Exception as e:
+
+            # Don't leave the mic muted forever if synthesis failed.
+            mic_muted_until = 0.0
 
             logger.exception(
                 "[TTS] Synthesis failed"
@@ -370,9 +418,8 @@ async def websocket_endpoint(
             "is_welcome": True,
         })
 
-        # Speak welcome — awaits the welcome task specifically. On a
-        # warm cache this resolves almost immediately; on a cold
-        # cache it behaves exactly like a normal synthesize() call.
+        # Speak welcome — awaits the welcome task specifically, and
+        # mutes the mic for its actual playback duration.
         await speak(
             welcome_question["id"],
             welcome_question["question_ar"],
@@ -463,6 +510,17 @@ async def websocket_endpoint(
                 continue
 
             if not audio_data:
+                continue
+
+            # =================================================
+            # DROP AUDIO WHILE THE AGENT IS SPEAKING
+            # =================================================
+            # Checked first, before any processing at all, so audio
+            # captured while a question is being (or about to be)
+            # spoken never reaches the resampler, VAD, or buffer —
+            # not "ignored after the fact", genuinely never handled.
+
+            if time.monotonic() < mic_muted_until:
                 continue
 
             # =================================================

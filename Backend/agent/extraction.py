@@ -16,7 +16,7 @@ from Backend.agent.state import AgentState
 llm = ChatGroq(
     api_key=config.GROQ_API_KEY,
     model="openai/gpt-oss-20b",
-    temperature=0,
+    temperature=0.2,
 )
 
 
