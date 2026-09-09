@@ -1,4 +1,10 @@
+import asyncio
+import json
 import logging
+import time
+import uuid
+import wave
+from pathlib import Path
 
 from fastapi import WebSocket, WebSocketDisconnect
 
@@ -24,6 +30,152 @@ INPUT_SAMPLE_RATE = 24000
 
 QUESTIONS_PATH = "Backend/agent/questions.json"
 
+RESULTS_DIR = Path("Backend/data/interviews")
+
+# Persistent cache of pre-synthesized question audio. Survives
+# server restarts — since questions.json is static and identical
+# for every candidate, audio only ever needs to be generated once,
+# not once per session.
+TTS_CACHE_DIR = Path("Backend/data/tts_cache")
+
+GOODBYE_ID = "__goodbye__"
+
+GOODBYE_MESSAGE = (
+    "شكراً جزيلاً لوقت حضرتك، بيانات حضرتك اتسجلت وهنتواصل معاك قريب. "
+    "مع السلامة."
+)
+
+
+def _write_candidate_json(candidate: dict, session_id: str) -> str:
+    """
+    Blocking file write — always call this via asyncio.to_thread().
+    Runs exactly once, at the very end of an interview (after the
+    audio pipeline for this session is already done), but keeping it
+    off the event loop costs nothing and means it can never delay
+    other concurrent sessions sharing this server.
+    """
+    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+
+    output_path = RESULTS_DIR / f"{session_id}.json"
+
+    with open(output_path, "w", encoding="utf-8") as f:
+        json.dump(candidate, f, ensure_ascii=False, indent=2)
+
+    return str(output_path)
+
+
+# ============================================================
+# PERSISTENT TTS CACHE
+# ============================================================
+# All blocking file I/O below is always called via asyncio.to_thread()
+# from the async helpers, so it never blocks the event loop.
+
+def _cache_path(question_id: str, speaker: str) -> Path:
+    # Speaker is part of the key: if VOICETUT_SPEAKER ever changes,
+    # old cached audio for the previous speaker is simply never
+    # matched again, rather than being served incorrectly.
+    safe_speaker = speaker.replace("/", "_")
+    return TTS_CACHE_DIR / f"{question_id}__{safe_speaker}.wav"
+
+
+def _read_cached_wav(path: Path):
+    with wave.open(str(path), "rb") as wav_file:
+        sample_rate = wav_file.getframerate()
+        pcm = wav_file.readframes(wav_file.getnframes())
+    return pcm, sample_rate
+
+
+def _write_cached_wav(path: Path, audio: bytes, sample_rate: int) -> None:
+    TTS_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+    with wave.open(str(path), "wb") as wav_file:
+        wav_file.setnchannels(1)
+        wav_file.setsampwidth(2)
+        wav_file.setframerate(sample_rate)
+        wav_file.writeframes(audio)
+
+
+async def _get_or_synthesize(
+    tts: VoiceTutTTS,
+    question_id: str,
+    text: str,
+) -> tuple[bytes, int]:
+    """
+    Returns cached audio for (question_id, speaker) if it already
+    exists on disk from a previous run; otherwise synthesizes it via
+    VoiceTut once and writes it to disk for every future connection
+    — including after the server itself restarts — to reuse.
+    """
+
+    path = _cache_path(question_id, tts.speaker)
+
+    if await asyncio.to_thread(path.exists):
+
+        logger.info(
+            "[TTS] Cache hit: %s",
+            question_id,
+        )
+
+        return await asyncio.to_thread(_read_cached_wav, path)
+
+    logger.info(
+        "[TTS] Cache miss, synthesizing: %s",
+        question_id,
+    )
+
+    audio, sample_rate = await tts.synthesize(text)
+
+    await asyncio.to_thread(
+        _write_cached_wav,
+        path,
+        audio,
+        sample_rate,
+    )
+
+    return audio, sample_rate
+
+
+def _start_tts_pregeneration(
+    interview_manager: InterviewManager,
+    tts: VoiceTutTTS,
+) -> dict:
+    """
+    Fire off cache-or-synthesize for every question in this session,
+    all at once, as background asyncio tasks — not awaited here.
+
+    On the very first run against a given questions.json + speaker,
+    this behaves exactly like before: N concurrent VoiceTut calls.
+    On every run after that, most/all of these resolve instantly
+    from disk, so start-of-session latency drops close to zero.
+    """
+
+    tasks = {}
+
+    for question in interview_manager.questions:
+
+        tasks[question["id"]] = asyncio.create_task(
+            _get_or_synthesize(
+                tts,
+                question["id"],
+                question["question_ar"],
+            )
+        )
+
+    tasks[GOODBYE_ID] = asyncio.create_task(
+        _get_or_synthesize(
+            tts,
+            GOODBYE_ID,
+            GOODBYE_MESSAGE,
+        )
+    )
+
+    logger.info(
+        "[TTS] Pre-generation started for %d items",
+        len(tasks),
+    )
+
+    return tasks
+
 
 async def websocket_endpoint(
     websocket: WebSocket,
@@ -32,6 +184,8 @@ async def websocket_endpoint(
     await websocket.accept()
 
     logger.info("[WS] Client connected")
+
+    session_id = f"{int(time.time())}_{uuid.uuid4().hex[:8]}"
 
     # =====================================================
     # SESSION COMPONENTS
@@ -59,6 +213,20 @@ async def websocket_endpoint(
     )
 
     # =====================================================
+    # KICK OFF PARALLEL TTS PRE-GENERATION (CACHE-BACKED)
+    # =====================================================
+    # Every question's audio starts loading (from cache) or
+    # synthesizing (on a true cache miss) right now, in the
+    # background, concurrently — before the welcome message has even
+    # been sent. speak() below will await the matching task instead
+    # of calling tts.synthesize() itself.
+
+    tts_tasks = _start_tts_pregeneration(
+        interview_manager,
+        tts,
+    )
+
+    # =====================================================
     # INITIAL SESSION STATE
     # =====================================================
 
@@ -79,24 +247,44 @@ async def websocket_endpoint(
     # TTS HELPER
     # =====================================================
 
-    async def speak(text: str):
+    async def speak(question_id: str, text: str):
+        """
+        question_id must match an id from questions.json, or
+        GOODBYE_ID. Falls back to synthesizing on the spot only if,
+        for some reason, no pre-generated task exists for this id
+        (e.g. a question id that isn't in tts_tasks) — this keeps
+        speak() working even if pre-generation and the actual
+        question set ever drift apart.
+        """
 
         if not text:
             return
 
-        logger.info(
-            "[TTS] Speaking: %s",
-            text,
-        )
+        task = tts_tasks.get(question_id)
 
         try:
 
-            audio, sample_rate = await tts.synthesize(
-                text
-            )
+            if task is not None:
+
+                logger.info(
+                    "[TTS] Awaiting pre-generated audio: %s",
+                    question_id,
+                )
+
+                audio, sample_rate = await task
+
+            else:
+
+                logger.warning(
+                    "[TTS] No pre-generated audio for %s, "
+                    "synthesizing on demand",
+                    question_id,
+                )
+
+                audio, sample_rate = await tts.synthesize(text)
 
             logger.info(
-                "[TTS] Generated %d bytes at %d Hz",
+                "[TTS] Audio ready: %d bytes at %d Hz",
                 len(audio),
                 sample_rate,
             )
@@ -182,9 +370,12 @@ async def websocket_endpoint(
             "is_welcome": True,
         })
 
-        # Speak welcome
+        # Speak welcome — awaits the welcome task specifically. On a
+        # warm cache this resolves almost immediately; on a cold
+        # cache it behaves exactly like a normal synthesize() call.
         await speak(
-            welcome_question["question_ar"]
+            welcome_question["id"],
+            welcome_question["question_ar"],
         )
 
         # -------------------------------------------------
@@ -230,7 +421,8 @@ async def websocket_endpoint(
 
         # Speak first question
         await speak(
-            first_question["question_ar"]
+            first_question["id"],
+            first_question["question_ar"],
         )
 
         # =================================================
@@ -470,9 +662,10 @@ async def websocket_endpoint(
                                         })
 
                                         await speak(
+                                            current_question["id"],
                                             current_question[
                                                 "question_ar"
-                                            ]
+                                            ],
                                         )
 
                                         continue
@@ -488,12 +681,49 @@ async def websocket_endpoint(
                                             "Interview completed"
                                         )
 
+                                        logger.info(
+                                            "[INTERVIEW] "
+                                            "Final candidate data: %s",
+                                            state["candidate"],
+                                        )
+
+                                        # Save the extracted data (not
+                                        # audio) off the event loop —
+                                        # runs once, doesn't touch the
+                                        # realtime audio path at all.
+                                        try:
+                                            saved_path = await asyncio.to_thread(
+                                                _write_candidate_json,
+                                                state["candidate"],
+                                                session_id,
+                                            )
+                                            logger.info(
+                                                "[INTERVIEW] Saved "
+                                                "candidate data to %s",
+                                                saved_path,
+                                            )
+                                        except Exception:
+                                            logger.exception(
+                                                "[INTERVIEW] Failed "
+                                                "to save candidate "
+                                                "data"
+                                            )
+
+                                        # Send the summary first so the
+                                        # client can display it right
+                                        # away, before the goodbye
+                                        # audio finishes generating.
                                         await websocket.send_json({
                                             "type": "interview_complete",
                                             "candidate": (
                                                 state["candidate"]
                                             ),
                                         })
+
+                                        await speak(
+                                            GOODBYE_ID,
+                                            GOODBYE_MESSAGE,
+                                        )
 
                                         return
 
@@ -526,9 +756,10 @@ async def websocket_endpoint(
                                         })
 
                                         await speak(
+                                            next_question["id"],
                                             next_question[
                                                 "question_ar"
-                                            ]
+                                            ],
                                         )
 
                                 except WebSocketDisconnect:
@@ -592,6 +823,14 @@ async def websocket_endpoint(
             raise
 
     finally:
+
+        # Cancel any TTS pre-generation tasks that are still running
+        # when the session ends (e.g. candidate hangs up early) so
+        # they don't keep the event loop doing pointless work for a
+        # connection that's already gone.
+        for task in tts_tasks.values():
+            if not task.done():
+                task.cancel()
 
         logger.info(
             "[WS] Connection closed"

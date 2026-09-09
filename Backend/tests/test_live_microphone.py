@@ -131,6 +131,22 @@ async def play_tts_audio(
     print("[MIC] Re-armed (bot finished speaking)")
 
 
+def print_candidate_summary(candidate: dict):
+    print()
+    print("=" * 50)
+    print("INTERVIEW COMPLETE — DATA COLLECTED")
+    print("=" * 50)
+
+    if not candidate:
+        print("(no data extracted)")
+    else:
+        for key, value in candidate.items():
+            print(f"  {key}: {value}")
+
+    print("=" * 50)
+    print()
+
+
 async def receive_messages(websocket):
     global bot_speaking
 
@@ -170,6 +186,11 @@ async def receive_messages(websocket):
                 elif message_type == "tts_end":
                     print(
                         "[TTS] Server finished sending audio"
+                    )
+
+                elif message_type == "interview_complete":
+                    print_candidate_summary(
+                        data.get("candidate", {})
                     )
 
             except Exception:
@@ -238,6 +259,12 @@ async def main():
 
             except asyncio.CancelledError:
                 pass
+
+            except websockets.exceptions.ConnectionClosed:
+                # Expected: the server closes the connection right
+                # after sending the goodbye message.
+                print()
+                print("Interview finished. Connection closed. Goodbye!")
 
             finally:
                 sender.cancel()
