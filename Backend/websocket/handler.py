@@ -45,6 +45,17 @@ GOODBYE_MESSAGE = (
     "مع السلامة."
 )
 
+# Sent as multiple smaller WebSocket frames instead of one big
+# send_bytes() call. Every other piece of audio (real questions) is
+# short enough that one frame never came close to a size limit — but
+# the end-of-interview summary reads back every collected field in
+# one paragraph, and at 24kHz 16-bit PCM that can comfortably exceed
+# a default per-message WebSocket size cap, which closes the
+# connection at the protocol level (below where our own except
+# Exception in speak() can catch and report it). Chunking sidesteps
+# the limit regardless of exactly where it sits.
+TTS_SEND_CHUNK_SIZE = 32 * 1024
+
 
 def _write_candidate_json(candidate: dict, session_id: str) -> str:
     """
@@ -239,6 +250,8 @@ async def websocket_endpoint(
         "response": "",
         "interview_finished": False,
         "extraction_success": False,
+        "failure_reason": None,
+        "mode": "interview",
     }
 
     speech_active = False
@@ -341,8 +354,14 @@ async def websocket_endpoint(
                 "channels": 1,
             })
 
-            # Send raw PCM audio
-            await websocket.send_bytes(audio)
+            # Send audio as multiple smaller frames instead of one
+            # send_bytes() call — see TTS_SEND_CHUNK_SIZE comment at
+            # the top of this file for why. The client buffers these
+            # and plays them as one clip on tts_end, so this is
+            # invisible to actual playback behavior.
+            for offset in range(0, len(audio), TTS_SEND_CHUNK_SIZE):
+                chunk = audio[offset:offset + TTS_SEND_CHUNK_SIZE]
+                await websocket.send_bytes(chunk)
 
             # Tell the client that TTS audio is finished
             await websocket.send_json({
@@ -350,7 +369,9 @@ async def websocket_endpoint(
             })
 
             logger.info(
-                "[TTS] Audio sent to client"
+                "[TTS] Audio sent to client (%d bytes, %d frame(s))",
+                len(audio),
+                -(-len(audio) // TTS_SEND_CHUNK_SIZE) if audio else 0,
             )
 
         except WebSocketDisconnect:

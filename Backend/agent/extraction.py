@@ -16,7 +16,7 @@ from Backend.agent.state import AgentState
 llm = ChatGroq(
     api_key=config.GROQ_API_KEY,
     model="openai/gpt-oss-20b",
-    temperature=0.1,
+    temperature=0.2,
 )
 
 
@@ -39,6 +39,7 @@ INVALID_TRANSCRIPTS = {
     "اه",
     "آه",
     "أيوه",
+    "@@فراغ",
     "فراغ",
 }
 
@@ -109,56 +110,15 @@ def create_update_tool(
         func=update_candidate_info,
         name="update_candidate_info",
         description=(
-            "Call this ONLY when the candidate has actually "
-            "answered the current interview question. "
-            "For anything else — greetings, yes/no "
+            "Update candidate information ONLY when the "
+            "candidate has actually answered the current "
+            "interview question. "
+            "DO NOT call this tool for greetings, yes/no "
             "acknowledgements, refusals, unrelated answers, "
-            "questions, or unclear speech — call reject_answer "
-            "instead."
+            "questions, or unclear speech."
         ),
         args_schema=UpdateModel,
     )
-
-
-# ============================================================
-# Static tool — reject the current question's answer, with a reason
-# ============================================================
-# Rather than guessing why the LLM declined to call
-# update_candidate_info, it's asked to explicitly say why by calling
-# this tool instead. The prompt's own examples already reason about
-# the difference between "unclear/no real content" and "answers a
-# different question" — this just makes that reasoning visible to
-# the code instead of throwing it away.
-
-class RejectAnswerArgs(BaseModel):
-
-    reason: str = Field(
-        ...,
-        description=(
-            "'unclear' if the candidate's speech was empty, "
-            "garbled, meaningless, or a plain acknowledgement/"
-            "filler word with no real content (e.g. 'نعم', "
-            "'تمام', 'مش عارف', silence). "
-            "'wrong_question' if the candidate said something "
-            "understandable and on-topic, but it answers a "
-            "DIFFERENT interview question, not the current one."
-        ),
-    )
-
-
-def _reject_answer(reason: str):
-    return {"reason": reason}
-
-
-reject_answer_tool = StructuredTool.from_function(
-    func=_reject_answer,
-    name="reject_answer",
-    description=(
-        "Call this INSTEAD OF update_candidate_info when the "
-        "candidate did NOT answer the current question."
-    ),
-    args_schema=RejectAnswerArgs,
-)
 
 
 # ============================================================
@@ -176,47 +136,53 @@ Your job is simple:
 3. Decide whether the candidate actually answered
    the current question.
 4. If they answered it, call update_candidate_info.
-5. If they did NOT answer it, call reject_answer with the
-   correct reason — NEVER just do nothing.
+5. If they did NOT answer it, DO NOT call the tool.
 
 ==================================================
 VERY IMPORTANT
 ==================================================
 
-Calling update_candidate_info means:
+A tool call means:
 
 "THE CANDIDATE ANSWERED THE CURRENT QUESTION."
 
-Therefore NEVER call update_candidate_info just because the
-candidate said something understandable. The answer MUST
-contain information relevant to the CURRENT QUESTION.
+Therefore NEVER call the tool just because the candidate
+said something understandable.
 
-You must ALWAYS call exactly one tool: either
-update_candidate_info (answered) or reject_answer (did not
-answer). Never respond without calling a tool.
+The answer MUST contain information relevant to the
+CURRENT QUESTION.
 
 ==================================================
-WHEN TO CALL reject_answer(reason="unclear")
+INVALID ANSWERS
 ==================================================
 
-- empty or silent speech
-- garbled / meaningless speech
-- plain acknowledgements or fillers with no real content,
-  such as:
-  "لا" "لأ" "مش عارف" "مش عارفة" "معرفش" "ماعرفش"
-  "نعم" "آه" "أيوه" "تمام" "منور" "ونكمل"
-  "فراغ" "@@فراغ"
+Do NOT call the tool for:
+
+"لا"
+"لأ"
+"مش عارف"
+"مش عارفة"
+"معرفش"
+"ماعرفش"
+"نعم"
+"آه"
+"أيوه"
+"تمام"
+"منور"
+"ونكمل"
+"فراغ"
+"@@فراغ"
+
+Also do NOT call the tool for:
+
 - greetings
-- questions asked back at the interviewer
-- speech that's simply too unclear to make sense of
-
-==================================================
-WHEN TO CALL reject_answer(reason="wrong_question")
-==================================================
-
-- the candidate's speech is understandable and clearly ON
-  TOPIC for some part of the interview, but it does NOT
-  answer the CURRENT question — it answers a different one
+- acknowledgements
+- confirmations
+- questions
+- unrelated statements
+- unclear speech
+- meaningless speech
+- an answer to another interview question
 
 ==================================================
 EXAMPLES
@@ -229,7 +195,7 @@ CANDIDATE:
 إي نعم
 
 RESULT:
-CALL reject_answer with reason="unclear"
+DO NOT CALL THE TOOL.
 
 --------------------------------------------------
 
@@ -253,7 +219,7 @@ CANDIDATE:
 @@فراغ
 
 RESULT:
-CALL reject_answer with reason="unclear"
+DO NOT CALL THE TOOL.
 
 --------------------------------------------------
 
@@ -277,7 +243,7 @@ CANDIDATE:
 ونكمل
 
 RESULT:
-CALL reject_answer with reason="unclear"
+DO NOT CALL THE TOOL.
 
 --------------------------------------------------
 
@@ -316,7 +282,7 @@ CANDIDATE:
 إنه مش فاهم معي
 
 RESULT:
-CALL reject_answer with reason="unclear"
+DO NOT CALL THE TOOL.
 
 --------------------------------------------------
 
@@ -340,7 +306,7 @@ CANDIDATE:
 نعم
 
 RESULT:
-CALL reject_answer with reason="unclear"
+DO NOT CALL THE TOOL.
 
 --------------------------------------------------
 
@@ -356,34 +322,25 @@ CALL update_candidate_info with:
 key_skills = ["Python", "SQL"]
 tools_technologies = ["Git", "Docker"]
 
---------------------------------------------------
+==================================================
+CRITICAL RULE
+==================================================
 
-CURRENT QUESTION:
+Do not extract information from an answer unless the answer
+actually answers the CURRENT QUESTION.
+
+For example:
+
+Question:
 ممكن أعرف اسم حضرتك بالكامل؟
 
-CANDIDATE:
-عندي 3 سنين خبرة
+Answer:
+عندي 3 سنين خبرة.
 
-RESULT:
-CALL reject_answer with reason="wrong_question"
+DO NOT call the tool.
 
-This is understandable, on-topic interview content — but it
-answers the EXPERIENCE question, not the NAME question that
-was actually asked.
-
---------------------------------------------------
-
-CURRENT QUESTION:
-إيه مؤهلك الدراسي أو أعلى شهادة معاك؟
-
-CANDIDATE:
-مستواي في الإنجليزي كويس
-
-RESULT:
-CALL reject_answer with reason="wrong_question"
-
-This answers the ENGLISH question, not the EDUCATION
-question that was actually asked.
+Even though "3 سنين خبرة" is useful candidate information,
+it answers a different question.
 
 ==================================================
 CURRENT QUESTION
@@ -504,7 +461,7 @@ async def extract_candidate_info(
     )
 
     extraction_llm = llm.bind_tools(
-        [update_tool, reject_answer_tool]
+        [update_tool]
     )
 
     # --------------------------------------------------------
@@ -545,52 +502,27 @@ async def extract_candidate_info(
     )
 
     # --------------------------------------------------------
-    # No tool call at all — shouldn't normally happen since the
-    # prompt insists on always calling one, but fall back safely
-    # to "unclear" rather than crashing if it ever does.
+    # No tool call = the model didn't extract anything for this
+    # question. Since is_obviously_invalid() already caught genuine
+    # empty/filler/silence transcripts earlier and returned before
+    # we ever got here, whatever reached this point had real,
+    # transcribed speech in it — so by elimination this means "said
+    # something, just not an answer to this question", not
+    # "didn't hear anything".
     # --------------------------------------------------------
 
     if not response.tool_calls:
 
         print(
             "[EXTRACTION] "
-            "No tool call at all -> treating as unclear."
+            "No tool call -> answer rejected."
         )
 
         return {
             **state,
             "extraction_success": False,
-            "failure_reason": "no_speech",
+            "failure_reason": "wrong_answer",
         }
-
-    # --------------------------------------------------------
-    # Explicit rejection
-    # --------------------------------------------------------
-
-    for tool_call in response.tool_calls:
-
-        if tool_call["name"] == "reject_answer":
-
-            reason = tool_call.get(
-                "args", {}
-            ).get("reason")
-
-            print(
-                "[EXTRACTION] Rejected, reason:",
-                reason,
-            )
-
-            failure_reason = (
-                "wrong_answer"
-                if reason == "wrong_question"
-                else "no_speech"
-            )
-
-            return {
-                **state,
-                "extraction_success": False,
-                "failure_reason": failure_reason,
-            }
 
     # --------------------------------------------------------
     # Process update_candidate_info call
@@ -653,7 +585,7 @@ async def extract_candidate_info(
         return {
             **state,
             "extraction_success": False,
-            "failure_reason": "no_speech",
+            "failure_reason": "wrong_answer",
         }
 
     # --------------------------------------------------------

@@ -1,4 +1,4 @@
-from typing import TypedDict
+from typing import Literal, TypedDict
 
 
 class CandidateInfo(TypedDict, total=False):
@@ -27,3 +27,19 @@ class AgentState(TypedDict):
     interview_finished: bool
 
     extraction_success: bool
+
+    # Why the last answer was rejected: "no_speech" (no usable
+    # transcript) or "wrong_answer" (real speech, wrong question).
+    # None when there's nothing to report (success, or before the
+    # first answer). Without this declared here, LangGraph has no
+    # channel for it — any node returning it gets the value silently
+    # dropped on the merge, which is why repeat_question() was always
+    # falling back to its "no_speech" default.
+    failure_reason: Literal["no_speech", "wrong_answer"] | None
+
+    # Which phase of the conversation we're in — drives routing in
+    # graph.py. "interview": walking through questions.json normally.
+    # "summary": the candidate is replying to the spoken summary.
+    # "correcting": they asked to change one field and are now
+    # re-answering that specific question.
+    mode: Literal["interview", "summary", "correcting"]

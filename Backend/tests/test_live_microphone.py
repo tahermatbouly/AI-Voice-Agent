@@ -152,6 +152,13 @@ async def receive_messages(websocket):
 
     tts_sample_rate = SAMPLE_RATE
 
+    # Accumulates chunks between tts_start and tts_end — the server
+    # now sends audio as multiple smaller frames instead of one big
+    # message (to stay under a WebSocket per-message size limit that
+    # the long end-of-interview summary was hitting), so we assemble
+    # them back into one clip before playing, same as before.
+    tts_audio_chunks = []
+
     while True:
         message = await websocket.recv()
 
@@ -172,6 +179,8 @@ async def receive_messages(websocket):
                         SAMPLE_RATE,
                     )
 
+                    tts_audio_chunks = []
+
                     # Gate the mic as soon as we know audio is
                     # coming — don't wait for the bytes to arrive,
                     # there can be a little network delay between
@@ -188,6 +197,21 @@ async def receive_messages(websocket):
                         "[TTS] Server finished sending audio"
                     )
 
+                    full_audio = b"".join(tts_audio_chunks)
+                    tts_audio_chunks = []
+
+                    if full_audio:
+                        await play_tts_audio(
+                            full_audio,
+                            tts_sample_rate,
+                        )
+                    else:
+                        # No audio arrived at all (e.g. empty text) —
+                        # nothing to play, so re-arm the mic directly
+                        # instead of waiting on play_tts_audio to do
+                        # it.
+                        bot_speaking = False
+
                 elif message_type == "interview_complete":
                     print_candidate_summary(
                         data.get("candidate", {})
@@ -198,10 +222,9 @@ async def receive_messages(websocket):
 
         elif isinstance(message, bytes):
 
-            await play_tts_audio(
-                message,
-                tts_sample_rate,
-            )
+            # Just buffer it — actual playback happens once, on
+            # tts_end, after every frame for this clip has arrived.
+            tts_audio_chunks.append(message)
 
 
 async def main():
