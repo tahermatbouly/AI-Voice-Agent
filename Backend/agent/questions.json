@@ -36,5 +36,15 @@
     "id": "q6_english",
     "question_ar": "مستواك إيه في الإنجليزي، خصوصًا في القراءة والكتابة؟",
     "target_field": "english_proficiency"
+  },
+  {
+    "id": "no_speech_retry",
+    "question_ar": "معلش، مسمعتش حضرتك كويس. ",
+    "type": "system_message"
+  },
+  {
+    "id": "wrong_answer_retry",
+    "question_ar": "معلش، الإجابة دي مش بتجاوب على السؤال ده. ",
+    "type": "system_message"
   }
 ]

@@ -16,7 +16,7 @@ from Backend.agent.state import AgentState
 llm = ChatGroq(
     api_key=config.GROQ_API_KEY,
     model="openai/gpt-oss-20b",
-    temperature=0.2,
+    temperature=0.1,
 )
 
 
@@ -39,7 +39,6 @@ INVALID_TRANSCRIPTS = {
     "اه",
     "آه",
     "أيوه",
-    "@@فراغ",
     "فراغ",
 }
 
@@ -56,7 +55,7 @@ def is_obviously_invalid(transcript: str) -> bool:
 
 
 # ============================================================
-# Dynamic tool creation
+# Dynamic tool creation — accept the current question's answer
 # ============================================================
 
 def create_update_tool(
@@ -110,15 +109,56 @@ def create_update_tool(
         func=update_candidate_info,
         name="update_candidate_info",
         description=(
-            "Update candidate information ONLY when the "
-            "candidate has actually answered the current "
-            "interview question. "
-            "DO NOT call this tool for greetings, yes/no "
+            "Call this ONLY when the candidate has actually "
+            "answered the current interview question. "
+            "For anything else — greetings, yes/no "
             "acknowledgements, refusals, unrelated answers, "
-            "questions, or unclear speech."
+            "questions, or unclear speech — call reject_answer "
+            "instead."
         ),
         args_schema=UpdateModel,
     )
+
+
+# ============================================================
+# Static tool — reject the current question's answer, with a reason
+# ============================================================
+# Rather than guessing why the LLM declined to call
+# update_candidate_info, it's asked to explicitly say why by calling
+# this tool instead. The prompt's own examples already reason about
+# the difference between "unclear/no real content" and "answers a
+# different question" — this just makes that reasoning visible to
+# the code instead of throwing it away.
+
+class RejectAnswerArgs(BaseModel):
+
+    reason: str = Field(
+        ...,
+        description=(
+            "'unclear' if the candidate's speech was empty, "
+            "garbled, meaningless, or a plain acknowledgement/"
+            "filler word with no real content (e.g. 'نعم', "
+            "'تمام', 'مش عارف', silence). "
+            "'wrong_question' if the candidate said something "
+            "understandable and on-topic, but it answers a "
+            "DIFFERENT interview question, not the current one."
+        ),
+    )
+
+
+def _reject_answer(reason: str):
+    return {"reason": reason}
+
+
+reject_answer_tool = StructuredTool.from_function(
+    func=_reject_answer,
+    name="reject_answer",
+    description=(
+        "Call this INSTEAD OF update_candidate_info when the "
+        "candidate did NOT answer the current question."
+    ),
+    args_schema=RejectAnswerArgs,
+)
 
 
 # ============================================================
@@ -136,53 +176,47 @@ Your job is simple:
 3. Decide whether the candidate actually answered
    the current question.
 4. If they answered it, call update_candidate_info.
-5. If they did NOT answer it, DO NOT call the tool.
+5. If they did NOT answer it, call reject_answer with the
+   correct reason — NEVER just do nothing.
 
 ==================================================
 VERY IMPORTANT
 ==================================================
 
-A tool call means:
+Calling update_candidate_info means:
 
 "THE CANDIDATE ANSWERED THE CURRENT QUESTION."
 
-Therefore NEVER call the tool just because the candidate
-said something understandable.
+Therefore NEVER call update_candidate_info just because the
+candidate said something understandable. The answer MUST
+contain information relevant to the CURRENT QUESTION.
 
-The answer MUST contain information relevant to the
-CURRENT QUESTION.
+You must ALWAYS call exactly one tool: either
+update_candidate_info (answered) or reject_answer (did not
+answer). Never respond without calling a tool.
 
 ==================================================
-INVALID ANSWERS
+WHEN TO CALL reject_answer(reason="unclear")
 ==================================================
 
-Do NOT call the tool for:
-
-"لا"
-"لأ"
-"مش عارف"
-"مش عارفة"
-"معرفش"
-"ماعرفش"
-"نعم"
-"آه"
-"أيوه"
-"تمام"
-"منور"
-"ونكمل"
-"فراغ"
-"@@فراغ"
-
-Also do NOT call the tool for:
-
+- empty or silent speech
+- garbled / meaningless speech
+- plain acknowledgements or fillers with no real content,
+  such as:
+  "لا" "لأ" "مش عارف" "مش عارفة" "معرفش" "ماعرفش"
+  "نعم" "آه" "أيوه" "تمام" "منور" "ونكمل"
+  "فراغ" "@@فراغ"
 - greetings
-- acknowledgements
-- confirmations
-- questions
-- unrelated statements
-- unclear speech
-- meaningless speech
-- an answer to another interview question
+- questions asked back at the interviewer
+- speech that's simply too unclear to make sense of
+
+==================================================
+WHEN TO CALL reject_answer(reason="wrong_question")
+==================================================
+
+- the candidate's speech is understandable and clearly ON
+  TOPIC for some part of the interview, but it does NOT
+  answer the CURRENT question — it answers a different one
 
 ==================================================
 EXAMPLES
@@ -195,7 +229,7 @@ CANDIDATE:
 إي نعم
 
 RESULT:
-DO NOT CALL THE TOOL.
+CALL reject_answer with reason="unclear"
 
 --------------------------------------------------
 
@@ -219,7 +253,7 @@ CANDIDATE:
 @@فراغ
 
 RESULT:
-DO NOT CALL THE TOOL.
+CALL reject_answer with reason="unclear"
 
 --------------------------------------------------
 
@@ -243,7 +277,7 @@ CANDIDATE:
 ونكمل
 
 RESULT:
-DO NOT CALL THE TOOL.
+CALL reject_answer with reason="unclear"
 
 --------------------------------------------------
 
@@ -282,7 +316,7 @@ CANDIDATE:
 إنه مش فاهم معي
 
 RESULT:
-DO NOT CALL THE TOOL.
+CALL reject_answer with reason="unclear"
 
 --------------------------------------------------
 
@@ -306,7 +340,7 @@ CANDIDATE:
 نعم
 
 RESULT:
-DO NOT CALL THE TOOL.
+CALL reject_answer with reason="unclear"
 
 --------------------------------------------------
 
@@ -322,25 +356,34 @@ CALL update_candidate_info with:
 key_skills = ["Python", "SQL"]
 tools_technologies = ["Git", "Docker"]
 
-==================================================
-CRITICAL RULE
-==================================================
+--------------------------------------------------
 
-Do not extract information from an answer unless the answer
-actually answers the CURRENT QUESTION.
-
-For example:
-
-Question:
+CURRENT QUESTION:
 ممكن أعرف اسم حضرتك بالكامل؟
 
-Answer:
-عندي 3 سنين خبرة.
+CANDIDATE:
+عندي 3 سنين خبرة
 
-DO NOT call the tool.
+RESULT:
+CALL reject_answer with reason="wrong_question"
 
-Even though "3 سنين خبرة" is useful candidate information,
-it answers a different question.
+This is understandable, on-topic interview content — but it
+answers the EXPERIENCE question, not the NAME question that
+was actually asked.
+
+--------------------------------------------------
+
+CURRENT QUESTION:
+إيه مؤهلك الدراسي أو أعلى شهادة معاك؟
+
+CANDIDATE:
+مستواي في الإنجليزي كويس
+
+RESULT:
+CALL reject_answer with reason="wrong_question"
+
+This answers the ENGLISH question, not the EDUCATION
+question that was actually asked.
 
 ==================================================
 CURRENT QUESTION
@@ -381,6 +424,7 @@ async def extract_candidate_info(
         return {
             **state,
             "extraction_success": False,
+            "failure_reason": "no_speech",
         }
 
     transcript = (
@@ -389,7 +433,8 @@ async def extract_candidate_info(
     )
 
     # --------------------------------------------------------
-    # Empty / obvious STT artifact
+    # Empty / obvious STT artifact — skip the LLM call entirely,
+    # we already know this is the "unclear" case.
     # --------------------------------------------------------
 
     if is_obviously_invalid(transcript):
@@ -403,6 +448,7 @@ async def extract_candidate_info(
         return {
             **state,
             "extraction_success": False,
+            "failure_reason": "no_speech",
         }
 
     # --------------------------------------------------------
@@ -429,6 +475,7 @@ async def extract_candidate_info(
         return {
             **state,
             "extraction_success": False,
+            "failure_reason": "no_speech",
         }
 
     print(
@@ -447,7 +494,9 @@ async def extract_candidate_info(
     )
 
     # --------------------------------------------------------
-    # Create question-specific tool
+    # Create question-specific tool, bound alongside the static
+    # reject_answer tool so the LLM must always pick one or the
+    # other — never call nothing.
     # --------------------------------------------------------
 
     update_tool = create_update_tool(
@@ -455,7 +504,7 @@ async def extract_candidate_info(
     )
 
     extraction_llm = llm.bind_tools(
-        [update_tool]
+        [update_tool, reject_answer_tool]
     )
 
     # --------------------------------------------------------
@@ -496,23 +545,55 @@ async def extract_candidate_info(
     )
 
     # --------------------------------------------------------
-    # No tool call = invalid answer
+    # No tool call at all — shouldn't normally happen since the
+    # prompt insists on always calling one, but fall back safely
+    # to "unclear" rather than crashing if it ever does.
     # --------------------------------------------------------
 
     if not response.tool_calls:
 
         print(
             "[EXTRACTION] "
-            "No tool call -> answer rejected."
+            "No tool call at all -> treating as unclear."
         )
 
         return {
             **state,
             "extraction_success": False,
+            "failure_reason": "no_speech",
         }
 
     # --------------------------------------------------------
-    # Process tool call
+    # Explicit rejection
+    # --------------------------------------------------------
+
+    for tool_call in response.tool_calls:
+
+        if tool_call["name"] == "reject_answer":
+
+            reason = tool_call.get(
+                "args", {}
+            ).get("reason")
+
+            print(
+                "[EXTRACTION] Rejected, reason:",
+                reason,
+            )
+
+            failure_reason = (
+                "wrong_answer"
+                if reason == "wrong_question"
+                else "no_speech"
+            )
+
+            return {
+                **state,
+                "extraction_success": False,
+                "failure_reason": failure_reason,
+            }
+
+    # --------------------------------------------------------
+    # Process update_candidate_info call
     # --------------------------------------------------------
 
     candidate = {
@@ -572,6 +653,7 @@ async def extract_candidate_info(
         return {
             **state,
             "extraction_success": False,
+            "failure_reason": "no_speech",
         }
 
     # --------------------------------------------------------
@@ -592,4 +674,297 @@ async def extract_candidate_info(
         **state,
         "candidate": candidate,
         "extraction_success": True,
+        "failure_reason": None,
     }
+
+
+# ============================================================
+# Retry / clarification lines
+# ============================================================
+# Spoken before repeating a question after a rejected answer. The
+# actual Arabic prefix text lives in questions.json (as the
+# "no_speech_retry" / "wrong_answer_retry" system_message entries)
+# rather than here — this just joins whatever prefix graph.py looks
+# up with that question's own question_ar.
+
+def build_retry_text(
+    question_ar: str,
+    prefix: str,
+) -> str:
+
+    return f"{prefix}{question_ar}"
+
+
+# ============================================================
+# End-of-interview summary
+# ============================================================
+# Everything below supports the "review your answers" step: turning
+# the collected candidate dict into spoken Arabic text, and later
+# classifying whether the candidate's reply to that summary means
+# "confirm, we're done" or "change one specific field".
+
+FIELD_LABELS: dict[str, str] = {
+    "candidate_name": "الاسم",
+    "target_domain": "المجال أو الشغلانة",
+    "years_of_experience": "سنين الخبرة",
+    "education_level": "المؤهل الدراسي",
+    "key_skills": "المهارات",
+    "tools_technologies": "الأدوات والبرامج",
+    "english_proficiency": "مستوى الإنجليزي",
+}
+
+# Fixed, readable order for the spoken summary — independent of
+# whatever order fields happened to be extracted/updated in.
+_SUMMARY_FIELD_ORDER = [
+    "candidate_name",
+    "target_domain",
+    "years_of_experience",
+    "education_level",
+    "key_skills",
+    "tools_technologies",
+    "english_proficiency",
+]
+
+
+def _format_summary_value(value) -> str:
+
+    if isinstance(value, list):
+        return "، ".join(str(item) for item in value)
+
+    return str(value)
+
+
+def build_summary_text(candidate: dict) -> str:
+    """
+    Builds the Arabic text spoken back to the candidate at the end
+    of the interview, listing every field collected so far. Called
+    both the first time (after the last question) and again after
+    every correction, since the values change each time.
+    """
+
+    lines = []
+
+    for field in _SUMMARY_FIELD_ORDER:
+
+        if field not in candidate:
+            continue
+
+        label = FIELD_LABELS.get(field, field)
+
+        lines.append(
+            f"{label}: {_format_summary_value(candidate[field])}"
+        )
+
+    body = "، ".join(lines)
+
+    return (
+        "خليني أراجع مع حضرتك البيانات اللي سجلتها: "
+        f"{body}. "
+        "لو كله تمام قول تمام أو صح عشان نخلص المكالمة، "
+        "ولو حابب تعدل حاجة قول مثلاً غيرلي المؤهل أو غيرلي الخبرة."
+    )
+
+
+# ------------------------------------------------------------
+# Summary reply classification tool
+# ------------------------------------------------------------
+
+class SummaryReplyArgs(BaseModel):
+
+    action: str = Field(
+        ...,
+        description=(
+            "'confirm' if the candidate is happy with the summary "
+            "and wants to finish the call. 'correct' if they want "
+            "to change one specific piece of information."
+        ),
+    )
+
+    field: str | None = Field(
+        default=None,
+        description=(
+            "Required when action is 'correct'. Must be exactly "
+            "one of: candidate_name, target_domain, "
+            "years_of_experience, education_level, key_skills, "
+            "tools_technologies, english_proficiency. "
+            "Omit when action is 'confirm'."
+        ),
+    )
+
+
+def _resolve_summary_reply(
+    action: str,
+    field: str | None = None,
+):
+    return {
+        "action": action,
+        "field": field,
+    }
+
+
+resolve_summary_reply_tool = StructuredTool.from_function(
+    func=_resolve_summary_reply,
+    name="resolve_summary_reply",
+    description=(
+        "Call this once you have decided whether the candidate "
+        "confirmed the summary as correct, or asked to change one "
+        "specific field in it."
+    ),
+    args_schema=SummaryReplyArgs,
+)
+
+summary_reply_llm = llm.bind_tools(
+    [resolve_summary_reply_tool]
+)
+
+
+SUMMARY_REPLY_PROMPT = """
+You are classifying an Egyptian Arabic candidate's reply to a
+spoken summary of their interview answers.
+
+Decide exactly one of two things:
+
+1. The candidate CONFIRMED the summary is correct and wants to
+   finish the call.
+2. The candidate wants to CORRECT one specific field.
+
+Always call resolve_summary_reply with your decision.
+
+==================================================
+VALID FIELDS FOR CORRECTION
+==================================================
+
+candidate_name          — الاسم
+target_domain           — المجال أو الشغلانة
+years_of_experience     — سنين الخبرة
+education_level         — المؤهل الدراسي
+key_skills              — المهارات
+tools_technologies      — الأدوات والبرامج
+english_proficiency     — مستوى الإنجليزي
+
+==================================================
+EXAMPLES
+==================================================
+
+CANDIDATE:
+تمام و صح و شكرا
+
+RESULT:
+action = "confirm"
+
+--------------------------------------------------
+
+CANDIDATE:
+ايوة كده تمام خلاص
+
+RESULT:
+action = "confirm"
+
+--------------------------------------------------
+
+CANDIDATE:
+غيرلي المؤهل
+
+RESULT:
+action = "correct"
+field = "education_level"
+
+--------------------------------------------------
+
+CANDIDATE:
+لأ عايز أعدل سنين الخبرة
+
+RESULT:
+action = "correct"
+field = "years_of_experience"
+
+--------------------------------------------------
+
+CANDIDATE:
+ممكن تغير الاسم، اسمي غلط
+
+RESULT:
+action = "correct"
+field = "candidate_name"
+
+--------------------------------------------------
+
+CANDIDATE:
+غيرلي المهارات والأدوات
+
+RESULT:
+action = "correct"
+field = "key_skills"
+
+==================================================
+CANDIDATE REPLY
+==================================================
+
+{transcript}
+"""
+
+
+async def classify_summary_reply(
+    transcript: str,
+) -> dict:
+    """
+    Returns one of:
+        {"action": "confirm", "field": None}
+        {"action": "correct", "field": <one of FIELD_LABELS>}
+        {"action": "unclear", "field": None}
+
+    "unclear" covers both a genuinely ambiguous reply and a
+    'correct' request naming a field we don't recognize — in both
+    cases the caller should just replay the summary rather than
+    guess.
+    """
+
+    transcript = transcript.strip()
+
+    if not transcript:
+        return {"action": "unclear", "field": None}
+
+    prompt = SUMMARY_REPLY_PROMPT.format(
+        transcript=transcript,
+    )
+
+    messages = [
+        SystemMessage(content=prompt),
+        HumanMessage(content=transcript),
+    ]
+
+    response = await summary_reply_llm.ainvoke(
+        messages
+    )
+
+    print(
+        "[SUMMARY] Raw response:",
+        response.content,
+    )
+
+    print(
+        "[SUMMARY] Tool calls:",
+        response.tool_calls,
+    )
+
+    if not response.tool_calls:
+        return {"action": "unclear", "field": None}
+
+    args = response.tool_calls[0].get("args", {})
+
+    action = args.get("action")
+    field = args.get("field")
+
+    if action == "confirm":
+        return {"action": "confirm", "field": None}
+
+    if action == "correct" and field in FIELD_LABELS:
+        return {"action": "correct", "field": field}
+
+    print(
+        "[SUMMARY] Unrecognized action/field:",
+        action,
+        field,
+    )
+
+    return {"action": "unclear", "field": None}
