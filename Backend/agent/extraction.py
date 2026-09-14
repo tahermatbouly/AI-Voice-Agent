@@ -65,22 +65,50 @@ def create_update_tool(
     """
     Create a tool that can ONLY update fields belonging
     to the current interview question.
+
+    Fields that represent multiple values use list[str].
+    Single-value fields use str.
     """
 
     fields = {}
 
+    # Fields that can contain multiple extracted values.
+    LIST_FIELDS = {
+        "key_skills",
+        "tools_technologies",
+    }
+
     for field in target_fields:
-        fields[field] = (
-            str | None,
-            Field(
-                default=None,
-                description=(
-                    f"Value extracted for {field}. "
-                    "Only provide this if the candidate "
-                    "actually answered the current question."
+
+        if field in LIST_FIELDS:
+
+            fields[field] = (
+                list[str] | None,
+                Field(
+                    default=None,
+                    description=(
+                        f"List of values extracted for {field}. "
+                        "Only provide this if the candidate "
+                        "actually answered the current question. "
+                        "Each item should be a separate skill, "
+                        "tool, technology, or programming language."
+                    ),
                 ),
-            ),
-        )
+            )
+
+        else:
+
+            fields[field] = (
+                str | None,
+                Field(
+                    default=None,
+                    description=(
+                        f"Value extracted for {field}. "
+                        "Only provide this if the candidate "
+                        "actually answered the current question."
+                    ),
+                ),
+            )
 
     UpdateModel = create_model(
         "CandidateUpdate",
@@ -96,11 +124,33 @@ def create_update_tool(
             if value is None:
                 continue
 
+            # Single-value fields
             if isinstance(value, str):
+
                 value = value.strip()
 
                 if not value:
                     continue
+
+            # Multi-value fields
+            elif isinstance(value, list):
+
+                cleaned_values = []
+
+                for item in value:
+
+                    if item is None:
+                        continue
+
+                    item = str(item).strip()
+
+                    if item:
+                        cleaned_values.append(item)
+
+                if not cleaned_values:
+                    continue
+
+                value = cleaned_values
 
             updates[field] = value
 

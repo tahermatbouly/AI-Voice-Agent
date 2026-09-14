@@ -46,5 +46,10 @@
     "id": "wrong_answer_retry",
     "question_ar": "معلش، الإجابة دي مش بتجاوب على السؤال ده. ",
     "type": "system_message"
+  },
+  {
+    "id":"waiting_for_summary",
+    "question_ar":"تمام, دلوقتي هنراجع مع حضرتك البيانات اللي حضرتك اديتهالنا و نتأكد من صحة المعلومات ,ثواني و نكمل مع حضرتك",
+    "type":"system_message"
   }
 ]
