@@ -42,4 +42,10 @@ class AgentState(TypedDict):
     # "summary": the candidate is replying to the spoken summary.
     # "correcting": they asked to change one field and are now
     # re-answering that specific question.
-    mode: Literal["interview", "summary", "correcting"]
+    mode: Literal[
+    "interview",
+    "summary",
+    "correcting",
+    "waiting_for_summary",
+    "building_summary",
+]

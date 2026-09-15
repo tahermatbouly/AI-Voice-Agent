@@ -16,22 +16,64 @@ class InterviewManager:
 
             self.questions = json.load(file)
 
+        # ----------------------------------------------------
+        # Separate real interview questions from system
+        # messages.
+        # ----------------------------------------------------
+
+        self.interview_questions = [
+            question
+            for question in self.questions
+            if question.get("type") != "system_message"
+        ]
+
+        self.system_messages = {
+            question["id"]: question
+            for question in self.questions
+            if question.get("type") == "system_message"
+        }
+
+    # ========================================================
+    # NORMAL QUESTIONS
+    # ========================================================
+
     def get_question(self, index: int):
 
-        if index >= len(self.questions):
+        if index < 0:
             return None
 
-        return self.questions[index]
+        if index >= len(self.interview_questions):
+            return None
 
-    def is_finished(self, index: int):
-
-        return index >= len(self.questions)
+        return self.interview_questions[index]
 
     def get_next_question(self, index: int):
 
         next_index = index + 1
 
-        if next_index >= len(self.questions):
+        if next_index >= len(self.interview_questions):
             return None
 
-        return self.questions[next_index]
+        return self.interview_questions[next_index]
+
+    def is_finished(self, index: int):
+
+        return index >= len(self.interview_questions)
+
+    # ========================================================
+    # SYSTEM MESSAGES
+    # ========================================================
+
+    def get_system_message(self, message_id: str):
+
+        return self.system_messages.get(message_id)
+
+    # ========================================================
+    # WAITING FOR SUMMARY
+    # ========================================================
+
+    def get_waiting_for_summary(self):
+
+        return self.get_system_message(
+            "waiting_for_summary"
+        )
