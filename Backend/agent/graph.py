@@ -10,59 +10,148 @@ from Backend.agent.extraction import (
 
 
 QUESTIONS_PATH = "Backend/agent/questions.json"
-SUMMARY_QUESTION_ID = "summary"
 
 interview_manager = InterviewManager(QUESTIONS_PATH)
 
 
-# ---------------------------------------------------------
-# Initialize
-# ---------------------------------------------------------
+# ============================================================
+# Initialize interview
+# ============================================================
 
-async def initialize_interview(state: AgentState):
+async def initialize_interview(
+    state: AgentState,
+) -> AgentState:
+
     welcome = interview_manager.get_question(0)
+
+    print(
+        "[GRAPH] Initializing interview"
+    )
+
+    print(
+        "[GRAPH] Welcome question:",
+        welcome["id"] if welcome else None,
+    )
 
     return {
         **state,
+        "questions": interview_manager.questions,
         "current_question_index": 0,
         "current_question": welcome,
-        "response": welcome["question_ar"],
-        "transcript": "",
-        "extraction_success": True,
-        "failure_reason": None,
+        "response": (
+            welcome["question_ar"]
+            if welcome
+            else ""
+        ),
         "interview_finished": False,
+        "extraction_success": False,
+        "transcript": "",
         "mode": "interview",
+        "failure_reason": None,
     }
 
 
-# ---------------------------------------------------------
-# Extract candidate answer
-# ---------------------------------------------------------
+# ============================================================
+# Extraction
+# ============================================================
 
-async def extract_answer(state: AgentState):
+async def extract_answer(
+    state: AgentState,
+) -> AgentState:
+
+    print(
+        "[GRAPH] Extracting answer for:",
+        (
+            state["current_question"]["id"]
+            if state.get("current_question")
+            else None
+        ),
+    )
+
     return await extract_candidate_info(state)
 
 
-# ---------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------
+# ============================================================
+# Question lookup helpers
+# ============================================================
 
-def _find_question_by_field(field: str):
-    for index, question in enumerate(interview_manager.questions):
+SUMMARY_QUESTION_ID = "summary"
+
+_RETRY_SUFFIXES = (
+    "__retry_no_speech",
+    "__retry_wrong_answer",
+)
+
+
+def _base_question_id(question_id: str) -> str:
+    """
+    A repeated question's id gets suffixed (see repeat_question
+    below) so speak() doesn't play stale cached audio for the wrong
+    text. This strips that suffix back off so the pristine original
+    question can always be found again, however many times in a row
+    it gets repeated — without this, a second consecutive failure
+    would re-prefix already-prefixed text instead of starting fresh.
+    """
+
+    for suffix in _RETRY_SUFFIXES:
+
+        if question_id.endswith(suffix):
+            return question_id[: -len(suffix)]
+
+    return question_id
+
+
+def _find_question_by_id(question_id: str) -> dict | None:
+
+    for question in interview_manager.questions:
+
+        if question.get("id") == question_id:
+            return question
+
+    return None
+
+
+def _find_question_by_field(field: str | None) -> dict | None:
+    """
+    Maps a candidate field name (e.g. "education_level") back to the
+    interview question that collects it (e.g. q4_education), so a
+    correction request can jump straight there.
+    """
+
+    if not field:
+        return None
+
+    for question in interview_manager.questions:
+
         if question.get("target_field") == field:
-            return index, question
+            return question
 
         if field in question.get("target_fields", []):
-            return index, question
+            return question
 
-    return None, None
+    return None
 
 
-# ---------------------------------------------------------
-# Build summary
-# ---------------------------------------------------------
+# ============================================================
+# Summary
+# ============================================================
 
-async def build_summary(state: AgentState):
+async def build_summary(
+    state: AgentState,
+) -> AgentState:
+    """
+    Builds the spoken end-of-interview summary from whatever's in
+    state["candidate"] right now. Reused both the first time (after
+    the last real question) and again after every correction, since
+    the values change each time.
+
+    Deliberately returns extraction_success=True: from handler.py's
+    point of view this is indistinguishable from "here is the next
+    question to ask" — it reuses that exact code path, so the
+    summary just gets spoken like any other question, with no
+    changes needed in handler.py.
+    """
+
     candidate = state.get("candidate", {})
 
     summary_text = build_summary_text(candidate)
@@ -72,106 +161,371 @@ async def build_summary(state: AgentState):
         "question_ar": summary_text,
     }
 
+    print(
+        "[GRAPH] Built summary for confirmation"
+    )
+
     return {
         **state,
         "current_question": summary_question,
         "response": summary_text,
+        "mode": "summary",
         "transcript": "",
         "extraction_success": True,
-        "failure_reason": None,
         "interview_finished": False,
-        "mode": "summary",
+        "failure_reason": None,
     }
 
 
-# ---------------------------------------------------------
-# Classify summary response
-# ---------------------------------------------------------
+async def classify_summary(
+    state: AgentState,
+) -> AgentState:
+    """
+    Handles the candidate's reply to the summary: either they
+    confirmed it (=> finish), asked to change a specific field
+    (=> jump back to that question), or said something ambiguous
+    (=> replay the summary rather than guess).
+    """
 
-async def classify_summary(state: AgentState):
     transcript = state.get("transcript", "").strip()
 
     decision = await classify_summary_reply(transcript)
 
-    # Candidate confirmed the information
-    if decision.get("action") == "confirm":
+    print(
+        "[GRAPH] Summary reply decision:",
+        decision,
+    )
+
+    # --------------------------------------------------------
+    # Confirmed — finish the interview. This reuses the exact
+    # same (extraction_success=True, interview_finished=True)
+    # shape advance_question used to produce, so handler.py's
+    # existing "interview finished" branch handles it unchanged.
+    # --------------------------------------------------------
+
+    if decision["action"] == "confirm":
+
         return {
             **state,
-            "transcript": "",
             "extraction_success": True,
-            "failure_reason": None,
             "interview_finished": True,
+            "transcript": "",
+            "failure_reason": None,
         }
 
-    # Candidate wants to correct something
-    if decision.get("action") == "correct":
-        field = decision.get("field")
+    # --------------------------------------------------------
+    # Correction requested — jump back to the matching question.
+    # --------------------------------------------------------
 
-        question_index, question = _find_question_by_field(field)
+    if decision["action"] == "correct":
 
-        if question is not None:
+        target_question = _find_question_by_field(
+            decision.get("field")
+        )
+
+        if target_question is not None:
+
+            print(
+                "[GRAPH] Jumping back to:",
+                target_question["id"],
+            )
+
             return {
                 **state,
-                "current_question_index": question_index,
-                "current_question": question,
-                "response": question["question_ar"],
-                "transcript": "",
-                "extraction_success": True,
-                "failure_reason": None,
-                "interview_finished": False,
+                "current_question": target_question,
+                "response": target_question["question_ar"],
                 "mode": "correcting",
+                "extraction_success": True,
+                "interview_finished": False,
+                "transcript": "",
+                "failure_reason": None,
             }
 
-    # Could not understand the summary response
+    # --------------------------------------------------------
+    # Unclear reply, or a field we couldn't map to a question —
+    # replay the summary rather than guess what they meant. Mode
+    # stays "summary" (untouched via the state spread below) so
+    # repeat_question knows this isn't a normal question retry.
+    # --------------------------------------------------------
+
+    print(
+        "[GRAPH] Summary reply unclear, replaying summary"
+    )
+
     return {
         **state,
-        "transcript": "",
         "extraction_success": False,
-        "failure_reason": "wrong_answer",
-        "interview_finished": False,
-        "mode": "summary",
+        "transcript": "",
+        "failure_reason": None,
     }
 
 
-# ---------------------------------------------------------
-# Move to next question
-# ---------------------------------------------------------
+# ============================================================
+# START routing
+# ============================================================
 
-async def advance_question(state: AgentState):
-    current_index = state["current_question_index"]
+def route_from_start(
+    state: AgentState,
+):
+
+    current_question = state.get(
+        "current_question"
+    )
+
+    transcript = state.get(
+        "transcript",
+        "",
+    ).strip()
+
+    mode = state.get(
+        "mode",
+        "interview",
+    )
+
+    print(
+        "[GRAPH] START ROUTER"
+    )
+
+    print(
+        "[GRAPH] Current question:",
+        (
+            current_question["id"]
+            if current_question
+            else None
+        ),
+    )
+
+    print(
+        "[GRAPH] Transcript:",
+        transcript,
+    )
+
+    print(
+        "[GRAPH] Mode:",
+        mode,
+    )
+
+    # --------------------------------------------------------
+    # First invocation
+    # --------------------------------------------------------
+
+    if current_question is None:
+
+        print(
+            "[GRAPH] Route -> initialize"
+        )
+
+        return "initialize"
+
+    # --------------------------------------------------------
+    # We already have a question.
+    # Therefore this invocation is processing
+    # the candidate's answer.
+    # --------------------------------------------------------
+
+    if transcript:
+
+        if mode == "summary":
+
+            print(
+                "[GRAPH] Route -> classify_summary"
+            )
+
+            return "classify_summary"
+
+        print(
+            "[GRAPH] Route -> extract"
+        )
+
+        return "extract"
+
+    # --------------------------------------------------------
+    # No question and no transcript
+    # --------------------------------------------------------
+
+    print(
+        "[GRAPH] Route -> initialize"
+    )
+
+    return "initialize"
+
+
+# ============================================================
+# After extraction
+# ============================================================
+
+def route_after_extraction(
+    state: AgentState,
+):
+
+    success = state.get(
+        "extraction_success",
+        False,
+    )
+
+    mode = state.get(
+        "mode",
+        "interview",
+    )
+
+    print(
+        "[GRAPH] Extraction success:",
+        success,
+    )
+
+    if not success:
+
+        print(
+            "[GRAPH] Route -> repeat"
+        )
+
+        return "repeat"
+
+    # A successful answer while correcting a summary field goes
+    # back to the summary (rebuilt with the new value), not forward
+    # through the normal question sequence.
+    if mode == "correcting":
+
+        print(
+            "[GRAPH] Route -> summarize (post-correction)"
+        )
+
+        return "summarize"
+
+    print(
+        "[GRAPH] Route -> advance"
+    )
+
+    return "advance"
+
+
+# ============================================================
+# After advancing
+# ============================================================
+
+def route_after_advance(
+    state: AgentState,
+):
+    """
+    advance_question sets current_question to None once it walks
+    past the last entry in questions.json. That's the signal to
+    build the summary instead of ending the graph normally.
+    """
+
+    if state.get("current_question") is None:
+
+        print(
+            "[GRAPH] Route -> summarize (end of questions)"
+        )
+
+        return "summarize"
+
+    return "end"
+
+
+# ============================================================
+# After summary classification
+# ============================================================
+
+def route_after_summary_classification(
+    state: AgentState,
+):
+
+    if state.get("extraction_success"):
+        return "end"
+
+    print(
+        "[GRAPH] Route -> repeat (unclear summary reply)"
+    )
+
+    return "repeat"
+
+
+# ============================================================
+# Advance
+# ============================================================
+
+async def advance_question(
+    state: AgentState,
+) -> AgentState:
+
+    current_index = state[
+        "current_question_index"
+    ]
+
     next_index = current_index + 1
 
-    # No more questions
-    if next_index >= len(interview_manager.questions):
+    next_question = (
+        interview_manager.get_question(
+            next_index
+        )
+    )
+
+    # questions.json now has two system_message entries appended
+    # after the real interview questions (the retry clarification
+    # lines). Walking into one of those by raw index means we've
+    # actually run out of real questions to ask — treat it exactly
+    # like next_question being None.
+    if (
+        next_question is not None
+        and next_question.get("type") == "system_message"
+    ):
+
+        print(
+            "[GRAPH] Reached system_message entry"
+            f" ({next_question['id']}) — treating as"
+            " end of real questions"
+        )
+
+        next_question = None
+
+    print(
+        "[GRAPH] Advancing from:",
+        (
+            state["current_question"]["id"]
+            if state.get("current_question")
+            else None
+        ),
+    )
+
+    print(
+        "[GRAPH] Next question:",
+        (
+            next_question["id"]
+            if next_question
+            else None
+        ),
+    )
+
+    # --------------------------------------------------------
+    # No more questions — routed to build_summary next, which
+    # will set current_question/response/mode appropriately.
+    # --------------------------------------------------------
+
+    if next_question is None:
+
         return {
             **state,
-            "current_question_index": next_index,
             "current_question": None,
-            "response": "",
+            "current_question_index": next_index,
             "transcript": "",
-            "extraction_success": True,
-            "failure_reason": None,
         }
 
-    next_question = interview_manager.questions[next_index]
-
-    # System messages are not interview questions.
-    # Reaching one means all real questions are finished.
-    if next_question.get("type") == "system_message":
-        return {
-            **state,
-            "current_question_index": next_index,
-            "current_question": None,
-            "response": "",
-            "transcript": "",
-            "extraction_success": True,
-            "failure_reason": None,
-        }
+    # --------------------------------------------------------
+    # Continue interview
+    #
+    # extraction_success is set True here (not left as whatever
+    # extract_answer produced) because advance_question is the last
+    # node executed before END on this path — its return values are
+    # what handler.py actually sees. Setting it False here (as an
+    # earlier version of this file did) would make handler.py treat
+    # every successful question transition as a failed answer.
+    # --------------------------------------------------------
 
     return {
         **state,
-        "current_question_index": next_index,
         "current_question": next_question,
+        "current_question_index": next_index,
         "response": next_question["question_ar"],
         "transcript": "",
         "extraction_success": True,
@@ -180,240 +534,209 @@ async def advance_question(state: AgentState):
     }
 
 
-# ---------------------------------------------------------
-# Repeat current question
-# ---------------------------------------------------------
+# ============================================================
+# Repeat
+# ============================================================
 
-async def repeat_question(state: AgentState):
-    current_question = state.get("current_question")
+async def repeat_question(
+    state: AgentState,
+) -> AgentState:
 
-    if current_question is None:
+    current_question = state.get(
+        "current_question"
+    )
+
+    mode = state.get(
+        "mode",
+        "interview",
+    )
+
+    # --------------------------------------------------------
+    # Unclear reply to the SUMMARY (not a real question) — just
+    # replay it as-is. No clarifying prefix here; that's specific
+    # to rejected answers on real interview questions.
+    # --------------------------------------------------------
+
+    if mode == "summary" or current_question is None:
+
+        print(
+            "[GRAPH] Repeating (as-is):",
+            (
+                current_question["id"]
+                if current_question
+                else None
+            ),
+        )
+
         return {
             **state,
+            "current_question": current_question,
+            "current_question_index": state[
+                "current_question_index"
+            ],
+            "response": (
+                current_question["question_ar"]
+                if current_question
+                else ""
+            ),
             "transcript": "",
             "extraction_success": False,
         }
 
-    return {
-        **state,
-        # Keep the original question unchanged.
-        # The retry phrase is handled separately by handler.py.
-        "current_question": current_question,
-        "response": current_question["question_ar"],
-        "transcript": "",
-        "extraction_success": False,
-        "failure_reason": state.get("failure_reason") or "wrong_answer",
-    }
+    # --------------------------------------------------------
+    # Rejected answer to a real question — always resolve back to
+    # the PRISTINE question object (never trust current_question
+    # directly, in case it's already been repeated once and could
+    # in principle carry stale data). Deliberately does NOT build a
+    # combined "prefix + question" string here — that would force a
+    # fresh on-demand synthesis on every single repeat. Instead the
+    # question keeps its original id/text unchanged, so speak() in
+    # handler.py plays its already-cached audio directly. The
+    # clarifying prefix (no_speech_retry / wrong_answer_retry) is
+    # spoken separately by handler.py, from ITS OWN cached audio —
+    # so a repeat costs zero VoiceTut calls after the first
+    # pregeneration pass, ever.
+    # --------------------------------------------------------
 
-# ---------------------------------------------------------
-# Waiting before summary
-# ---------------------------------------------------------
-
-async def waiting_for_summary(state: AgentState):
-    waiting_message = interview_manager.get_system_message(
-        "waiting_for_summary"
+    base_id = _base_question_id(
+        current_question["id"]
     )
 
-    if waiting_message is None:
-        raise ValueError(
-            "waiting_for_summary is missing from questions.json"
-        )
+    base_question = (
+        _find_question_by_id(base_id)
+        or current_question
+    )
+
+    print(
+        "[GRAPH] Repeating (cached):",
+        base_question["id"],
+    )
 
     return {
         **state,
-        "current_question": waiting_message,
-        "response": waiting_message["question_ar"],
+        "current_question": base_question,
+        "current_question_index": state[
+            "current_question_index"
+        ],
+        "response": base_question["question_ar"],
         "transcript": "",
-        "extraction_success": True,
-        "failure_reason": None,
-        "interview_finished": False,
-        "mode": "waiting_for_summary",
+        "extraction_success": False,
     }
 
 
-# ---------------------------------------------------------
-# Routing
-# ---------------------------------------------------------
-
-def route_from_start(state: AgentState):
-    mode = state.get("mode")
-
-    if mode == "building_summary":
-        return "summary"
-
-    if mode == "summary":
-        return "classify_summary"
-
-    if state.get("transcript"):
-        return "extract"
-
-    if state.get("current_question") is None:
-        return "initialize"
-
-    return "initialize"
-
-def route_after_extraction(state: AgentState):
-    if not state.get("extraction_success"):
-        return "repeat"
-
-    # Correction was successfully extracted.
-    if state.get("mode") == "correcting":
-        return "summary"
-
-    return "advance"
-
-
-def route_after_advance(state: AgentState):
-    if state.get("current_question") is None:
-        return "waiting_for_summary"
-
-    return END
-
-
-def route_after_summary(state: AgentState):
-    if state.get("extraction_success"):
-        return END
-
-    return "repeat"
-
-# ---------------------------------------------------------
+# ============================================================
 # Build graph
-# ---------------------------------------------------------
-graph = StateGraph(AgentState)
+# ============================================================
 
-graph.add_node(
-    "initialize",
+builder = StateGraph(AgentState)
+
+
+builder.add_node(
+    "initialize_interview",
     initialize_interview,
 )
 
-graph.add_node(
-    "extract",
+builder.add_node(
+    "extract_answer",
     extract_answer,
 )
 
-graph.add_node(
-    "advance",
+builder.add_node(
+    "advance_question",
     advance_question,
 )
 
-graph.add_node(
-    "repeat",
+builder.add_node(
+    "repeat_question",
     repeat_question,
 )
 
-graph.add_node(
-    "waiting_for_summary",
-    waiting_for_summary,
-)
-
-graph.add_node(
-    "summary",
+builder.add_node(
+    "build_summary",
     build_summary,
 )
 
-graph.add_node(
+builder.add_node(
     "classify_summary",
     classify_summary,
 )
 
 
 # ============================================================
-# START
+# IMPORTANT:
+# START must be conditional
 # ============================================================
 
-graph.add_conditional_edges(
+builder.add_conditional_edges(
     START,
     route_from_start,
     {
-        "initialize": "initialize",
-        "extract": "extract",
-        "summary": "summary",
+        "initialize": "initialize_interview",
+        "extract": "extract_answer",
         "classify_summary": "classify_summary",
     },
 )
 
 
-# ============================================================
-# INITIALIZE
-# ============================================================
-
-graph.add_edge(
-    "initialize",
+# Initialization ends after setting welcome
+builder.add_edge(
+    "initialize_interview",
     END,
 )
 
 
 # ============================================================
-# EXTRACT
+# Extraction routing
 # ============================================================
 
-graph.add_conditional_edges(
-    "extract",
+builder.add_conditional_edges(
+    "extract_answer",
     route_after_extraction,
     {
-        "repeat": "repeat",
-        "advance": "advance",
-        "summary": "summary",
+        "advance": "advance_question",
+        "repeat": "repeat_question",
+        "summarize": "build_summary",
     },
 )
 
 
 # ============================================================
-# REPEAT
+# Advance routing
 # ============================================================
 
-graph.add_edge(
-    "repeat",
-    END,
-)
-
-
-# ============================================================
-# ADVANCE
-# ============================================================
-
-graph.add_conditional_edges(
-    "advance",
+builder.add_conditional_edges(
+    "advance_question",
     route_after_advance,
     {
-        "waiting_for_summary": "waiting_for_summary",
-        END: END,
+        "summarize": "build_summary",
+        "end": END,
     },
 )
 
 
-# ============================================================
-# WAITING FOR SUMMARY
-# ============================================================
+builder.add_edge(
+    "repeat_question",
+    END,
+)
 
-graph.add_edge(
-    "waiting_for_summary",
+builder.add_edge(
+    "build_summary",
     END,
 )
 
 
 # ============================================================
-# SUMMARY
+# Summary classification routing
 # ============================================================
 
-graph.add_edge(
-    "summary",
-    END,
-)
-
-
-# ============================================================
-# SUMMARY CLASSIFICATION
-# ============================================================
-
-graph.add_conditional_edges(
+builder.add_conditional_edges(
     "classify_summary",
-    route_after_summary,
+    route_after_summary_classification,
     {
-        "repeat": "repeat",
-        END: END,
+        "repeat": "repeat_question",
+        "end": END,
     },
 )
 
 
-agent_graph = graph.compile()
+agent_graph = builder.compile()
