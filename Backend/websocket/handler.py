@@ -1,11 +1,11 @@
 import asyncio
 import json
+import logging
 import time
 import uuid
 import wave
 from pathlib import Path
 
-import numpy as np
 from fastapi import WebSocket, WebSocketDisconnect
 
 from Backend.audio.audio_utils import (
@@ -15,99 +15,47 @@ from Backend.audio.audio_utils import (
     StreamResampler,
 )
 from Backend.audio.buffer import AudioBuffer
+from Backend.audio.recorder import AnswerRecorder
 from Backend.audio.vad import VoiceActivityDetector
-from Backend.audio.background_mixer import BackgroundMixer
 from Backend.stt_plugin import CohereArabicSTT
 
 from Backend.agent.graph import agent_graph
-from Backend.agent.interview_manager import InterviewManager
+from Backend.agent.interview_manager import (
+    InterviewManager,
+    BEFORE_FOLLOWUPS_ID,
+    NO_SPEECH_RETRY_ID,
+    WRONG_ANSWER_RETRY_ID,
+)
 from Backend.tts_plugin import VoiceTutTTS
 
-from Backend.utils.logger import (
-    logger,
-    get_conversation_logger,
-)
+
+logger = logging.getLogger("websocket")
 
 
 INPUT_SAMPLE_RATE = 24000
 
 QUESTIONS_PATH = "Backend/agent/questions.json"
 
-RESULTS_DIR = Path(
-    "Backend/data/interviews"
-)
+RESULTS_DIR = Path("Backend/data/interviews")
 
-# Persistent TTS cache.
+# Persistent TTS cache, keyed by item_id + speaker.
 #
-# Static items from questions.json are cached by:
-#
-#     question_id + speaker
-#
-# This includes:
-#
-#     welcome
-#     q1_name
-#     q2_domain
-#     q3_experience
-#     q4_education
-#     q5_skills_tools
-#     q6_english
-#     no_speech_retry
-#     wrong_answer_retry
-#     waiting_for_summary
-#
-# The goodbye message is also cached separately.
-TTS_CACHE_DIR = Path(
-    "Backend/data/tts_cache"
-)
+# In one-paragraph mode EVERY spoken clip is static (intro, each
+# field's follow-up question, the system messages, completion), so
+# after the first run against a given speaker there is never another
+# live VoiceTut call. There is no dynamically built text anywhere in
+# this flow.
+TTS_CACHE_DIR = Path("Backend/data/tts_cache")
 
-GOODBYE_ID = "__goodbye__"
+# Keep WebSocket audio messages below common message-size limits.
+TTS_SEND_CHUNK_SIZE = 32 * 1024
 
-GOODBYE_MESSAGE = (
-    "شكراً جزيلاً لوقت حضرتك، بيانات حضرتك اتسجلت وهنتواصل معاك قريب. "
-    "مع السلامة."
-)
-
-# ============================================================
-# CONTINUOUS AUDIO STREAM
-# ============================================================
-
-# VoiceTut is expected to produce 24 kHz mono int16 PCM.
-TTS_SAMPLE_RATE = 24000
-TTS_SAMPLE_WIDTH = 2  # int16
-
-# We send audio to the client in small real-time frames.
-#
-# 20 ms @ 24 kHz:
-#
-#     24000 * 0.020 = 480 samples
-#
-#     480 * 2 bytes = 960 bytes
-#
-AUDIO_FRAME_DURATION = 0.020
-
-AUDIO_FRAME_SAMPLES = int(
-    TTS_SAMPLE_RATE
-    * AUDIO_FRAME_DURATION
-)
-
-AUDIO_FRAME_BYTES = (
-    AUDIO_FRAME_SAMPLES
-    * TTS_SAMPLE_WIDTH
-)
-
-
-# ============================================================
-# BACKGROUND AUDIO
-# ============================================================
-
-BACKGROUND_AMBIENCE_PATH = (
-    "Backend/data/sounds/processed/call_center.wav"
-)
-
-BACKGROUND_RING_PATH = (
-    "Backend/data/sounds/processed/phone_ring.wav"
-)
+# The opening paragraph is long and the candidate pauses to think
+# mid-answer, so the turn must not end on a short pause. Follow-up
+# answers are short, so a long threshold there would just add dead
+# air before the agent replies.
+INTRO_SILENCE_MS = 1500
+FOLLOWUP_SILENCE_MS = 500
 
 
 # ============================================================
@@ -119,34 +67,15 @@ def _write_candidate_json(
     session_id: str,
 ) -> str:
     """
-    Blocking file write.
-
-    Called through asyncio.to_thread() so the event loop is never
-    blocked by file I/O.
+    Blocking file write — always called via asyncio.to_thread().
     """
 
-    RESULTS_DIR.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
+    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 
-    output_path = (
-        RESULTS_DIR
-        / f"{session_id}.json"
-    )
+    output_path = RESULTS_DIR / f"{session_id}.json"
 
-    with open(
-        output_path,
-        "w",
-        encoding="utf-8",
-    ) as f:
-
-        json.dump(
-            candidate,
-            f,
-            ensure_ascii=False,
-            indent=2,
-        )
+    with open(output_path, "w", encoding="utf-8") as f:
+        json.dump(candidate, f, ensure_ascii=False, indent=2)
 
     return str(output_path)
 
@@ -155,47 +84,18 @@ def _write_candidate_json(
 # PERSISTENT TTS CACHE
 # ============================================================
 
-def _cache_path(
-    question_id: str,
-    speaker: str,
-) -> Path:
-    """
-    Build the persistent cache path.
+def _cache_path(item_id: str, speaker: str) -> Path:
 
-    Speaker is part of the filename so changing the VoiceTut
-    speaker automatically creates a separate cache.
-    """
+    safe_speaker = speaker.replace("/", "_")
 
-    safe_speaker = speaker.replace(
-        "/",
-        "_",
-    )
-
-    return (
-        TTS_CACHE_DIR
-        / f"{question_id}__{safe_speaker}.wav"
-    )
+    return TTS_CACHE_DIR / f"{item_id}__{safe_speaker}.wav"
 
 
-def _read_cached_wav(
-    path: Path,
-) -> tuple[bytes, int]:
-    """
-    Blocking WAV read.
-    """
+def _read_cached_wav(path: Path) -> tuple[bytes, int]:
 
-    with wave.open(
-        str(path),
-        "rb",
-    ) as wav_file:
-
-        sample_rate = (
-            wav_file.getframerate()
-        )
-
-        pcm = wav_file.readframes(
-            wav_file.getnframes()
-        )
+    with wave.open(str(path), "rb") as wav_file:
+        sample_rate = wav_file.getframerate()
+        pcm = wav_file.readframes(wav_file.getnframes())
 
     return pcm, sample_rate
 
@@ -205,25 +105,13 @@ def _write_cached_wav(
     audio: bytes,
     sample_rate: int,
 ) -> None:
-    """
-    Blocking WAV write.
-    """
 
-    TTS_CACHE_DIR.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
+    TTS_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
-    with wave.open(
-        str(path),
-        "wb",
-    ) as wav_file:
-
+    with wave.open(str(path), "wb") as wav_file:
         wav_file.setnchannels(1)
         wav_file.setsampwidth(2)
-        wav_file.setframerate(
-            sample_rate
-        )
+        wav_file.setframerate(sample_rate)
         wav_file.writeframes(audio)
 
 
@@ -232,52 +120,18 @@ async def _get_or_synthesize(
     item_id: str,
     text: str,
 ) -> tuple[bytes, int]:
-    """
-    Get an item's audio from the persistent cache.
 
-    If it doesn't exist, synthesize it once and save it.
+    path = _cache_path(item_id, tts.speaker)
 
-    Used for:
-        - normal questions
-        - retry messages
-        - goodbye
-    """
+    if await asyncio.to_thread(path.exists):
 
-    path = _cache_path(
-        item_id,
-        tts.speaker,
-    )
+        logger.info("[TTS] Cache hit: %s", item_id)
 
-    # --------------------------------------------------------
-    # CACHE HIT
-    # --------------------------------------------------------
+        return await asyncio.to_thread(_read_cached_wav, path)
 
-    if await asyncio.to_thread(
-        path.exists,
-    ):
+    logger.info("[TTS] Cache miss, synthesizing: %s", item_id)
 
-        logger.info(
-            "[TTS] Cache hit: %s",
-            item_id,
-        )
-
-        return await asyncio.to_thread(
-            _read_cached_wav,
-            path,
-        )
-
-    # --------------------------------------------------------
-    # CACHE MISS
-    # --------------------------------------------------------
-
-    logger.info(
-        "[TTS] Cache miss, synthesizing: %s",
-        item_id,
-    )
-
-    audio, sample_rate = (
-        await tts.synthesize(text)
-    )
+    audio, sample_rate = await tts.synthesize(text)
 
     await asyncio.to_thread(
         _write_cached_wav,
@@ -294,36 +148,20 @@ def _start_tts_pregeneration(
     tts: VoiceTutTTS,
 ) -> dict:
     """
-    Start loading/synthesizing every static TTS item concurrently.
+    Start loading/synthesizing every clip concurrently, in the
+    background, before the intro is even spoken.
 
-    Dynamic summary text is NOT included because its text changes
-    depending on the candidate.
+    interview_manager.tts_items() is exhaustive for this mode, so
+    every speak() below is guaranteed to be an await on one of
+    these tasks — never an on-demand synthesis.
     """
 
-    tasks = {}
-
-    for item in interview_manager.questions:
-
-        tasks[item["id"]] = (
-            asyncio.create_task(
-                _get_or_synthesize(
-                    tts,
-                    item["id"],
-                    item["question_ar"],
-                )
-            )
+    tasks = {
+        item_id: asyncio.create_task(
+            _get_or_synthesize(tts, item_id, text)
         )
-
-    # Goodbye is static but isn't in questions.json.
-    tasks[GOODBYE_ID] = (
-        asyncio.create_task(
-            _get_or_synthesize(
-                tts,
-                GOODBYE_ID,
-                GOODBYE_MESSAGE,
-            )
-        )
-    )
+        for item_id, text in interview_manager.tts_items()
+    }
 
     logger.info(
         "[TTS] Started pre-generation for %d static items",
@@ -334,83 +172,16 @@ def _start_tts_pregeneration(
 
 
 # ============================================================
-# TTS AUDIO VALIDATION
-# ============================================================
-
-def _validate_tts_audio(
-    audio: bytes,
-    sample_rate: int,
-    item_id: str,
-) -> None:
-    """
-    Validate that TTS audio matches the continuous output stream.
-
-    The background stream and TTS must both be:
-
-        24 kHz
-        mono
-        signed 16-bit PCM
-        raw PCM
-    """
-
-    if sample_rate != TTS_SAMPLE_RATE:
-
-        raise ValueError(
-            f"TTS sample rate mismatch for "
-            f"{item_id}: "
-            f"expected {TTS_SAMPLE_RATE}, "
-            f"got {sample_rate}"
-        )
-
-    if len(audio) % TTS_SAMPLE_WIDTH != 0:
-
-        raise ValueError(
-            f"TTS PCM byte count is not divisible "
-            f"by {TTS_SAMPLE_WIDTH}: "
-            f"{len(audio)}"
-        )
-
-
-# ============================================================
 # WEBSOCKET ENDPOINT
 # ============================================================
 
-async def websocket_endpoint(
-    websocket: WebSocket,
-):
+async def websocket_endpoint(websocket: WebSocket):
 
     await websocket.accept()
 
-    call_id = str(
-        uuid.uuid4()
-    )
+    logger.info("[WS] Client connected")
 
-    conversation_logger = (
-        get_conversation_logger(call_id)
-    )
-
-    logger.info(
-        "[WS] Call started: %s",
-        call_id,
-    )
-
-    conversation_logger.info(
-        "========== CALL STARTED =========="
-    )
-
-    conversation_logger.info(
-        "Call ID: %s",
-        call_id,
-    )
-
-    logger.info(
-        "[WS] Client connected"
-    )
-
-    session_id = (
-        f"{int(time.time())}_"
-        f"{uuid.uuid4().hex[:8]}"
-    )
+    session_id = f"{int(time.time())}_{uuid.uuid4().hex[:8]}"
 
     # ========================================================
     # SESSION COMPONENTS
@@ -418,129 +189,27 @@ async def websocket_endpoint(
 
     audio_buffer = AudioBuffer()
 
-    vad = VoiceActivityDetector()
+    recorder = AnswerRecorder(session_id)
+
+    # Starts in long-pause mode: the very first thing the candidate
+    # does is give the long opening paragraph.
+    vad = VoiceActivityDetector(
+        min_silence_duration_ms=INTRO_SILENCE_MS,
+    )
 
     stt = CohereArabicSTT()
 
     tts = VoiceTutTTS()
 
-    # Stateful resampler.
-    #
-    # Do NOT reset this between utterances.
+    # Stateful — do NOT reset between utterances.
     resampler = StreamResampler(
         source_rate=INPUT_SAMPLE_RATE,
         target_rate=TARGET_SAMPLE_RATE,
     )
 
-    interview_manager = InterviewManager(
-        QUESTIONS_PATH
-    )
+    interview_manager = InterviewManager(QUESTIONS_PATH)
 
-    # ========================================================
-    # BACKGROUND MIXER
-    # ========================================================
-
-    background_mixer = None
-
-    try:
-
-        ambience_path = Path(
-            BACKGROUND_AMBIENCE_PATH
-        )
-
-        ring_path = Path(
-            BACKGROUND_RING_PATH
-        )
-
-        if (
-            ambience_path.exists()
-            and ring_path.exists()
-        ):
-
-            background_mixer = (
-                BackgroundMixer(
-                    ambience_path=str(
-                        ambience_path
-                    ),
-                    ring_path=str(
-                        ring_path
-                    ),
-
-                    # These are deliberately subtle.
-                    #
-                    # The standalone mixer test can use much higher
-                    # values, but for a real voice call the background
-                    # should sit underneath the agent's voice.
-                    ambience_volume=0.035,
-                    ring_volume=0.06,
-
-                    ring_min_interval=18.0,
-                    ring_max_interval=40.0,
-                )
-            )
-
-            logger.info(
-                "[AUDIO] Background mixer initialized"
-            )
-
-            logger.info(
-                "[AUDIO] Ambience: %s",
-                ambience_path,
-            )
-
-            logger.info(
-                "[AUDIO] Ring: %s",
-                ring_path,
-            )
-
-        else:
-
-            logger.warning(
-                "[AUDIO] Background audio disabled. "
-                "Missing file(s): ambience=%s | ring=%s",
-                ambience_path.exists(),
-                ring_path.exists(),
-            )
-
-    except Exception:
-
-        logger.exception(
-            "[AUDIO] Failed to initialize "
-            "background mixer"
-        )
-
-        background_mixer = None
-
-    # ========================================================
-    # RETRY MESSAGES
-    # ========================================================
-    #
-    # These are system_message entries from questions.json.
-    #
-    # They are cached independently:
-    #
-    #     no_speech_retry.wav
-    #     wrong_answer_retry.wav
-    #
-    # They are NEVER combined with the original question.
-
-    retry_messages = {
-        item["id"]: item
-        for item in interview_manager.questions
-        if item.get("type")
-        == "system_message"
-    }
-
-    # ========================================================
-    # TTS PRE-GENERATION
-    # ========================================================
-
-    tts_tasks = (
-        _start_tts_pregeneration(
-            interview_manager,
-            tts,
-        )
-    )
+    tts_tasks = _start_tts_pregeneration(interview_manager, tts)
 
     # ========================================================
     # INITIAL STATE
@@ -549,14 +218,13 @@ async def websocket_endpoint(
     state = {
         "transcript": "",
         "candidate": {},
-        "questions": interview_manager.questions,
-        "current_question_index": -1,
-        "current_question": None,
-        "response": "",
-        "interview_finished": False,
+        "mode": "intro",
+        "current_field": None,
+        "current_prompt": None,
         "extraction_success": False,
         "failure_reason": None,
-        "mode": "interview",
+        "interview_finished": False,
+        "first_followup": False,
     }
 
     speech_active = False
@@ -566,337 +234,54 @@ async def websocket_endpoint(
     mic_muted_until = 0.0
 
     # ========================================================
-    # CONTINUOUS TTS QUEUE
-    # ========================================================
-    #
-    # Each queue item is:
-    #
-    #     (audio, playback_finished_event)
-    #
-    # The audio output loop consumes the audio in real time.
-    #
-    # This is important because `speak()` must NOT directly write
-    # audio to the WebSocket anymore.
-    #
-    # Otherwise we would have:
-    #
-    #     background task -> websocket
-    #     speak()         -> websocket
-    #
-    # at the same time.
-
-    tts_audio_queue = asyncio.Queue()
-
-    # This flag controls the lifetime of the continuous audio loop.
-    audio_output_running = True
-
-    # ========================================================
-    # CONTINUOUS AUDIO OUTPUT LOOP
+    # SPEAK ONE CLIP
     # ========================================================
 
-    async def audio_output_loop():
+    async def speak(item_id: str, text: str):
         """
-        Continuously send the caller's outgoing audio stream.
-
-        Every frame contains:
-
-            background ambience
-                +
-            phone ring when scheduled
-                +
-            TTS when currently playing
-
-        This loop continues while:
-
-            - user is speaking
-            - VAD is running
-            - STT is processing
-            - LangGraph is running
-            - LLM is extracting
-            - TTS is synthesizing
-            - no TTS is playing
-
-        Only the outgoing audio stream is affected.
-
-        The user's microphone audio is NEVER mixed with
-        background audio.
+        Speak exactly ONE cached clip. Never combines two pieces of
+        text — that's what would force a live synthesis.
         """
 
-        current_tts = b""
-        current_tts_position = 0
-        current_tts_finished_event = None
-
-        while audio_output_running:
-
-            try:
-
-                # =================================================
-                # GET BACKGROUND FRAME
-                # =================================================
-
-                if background_mixer is not None:
-
-                    background = (
-                        background_mixer.next_frame(
-                            AUDIO_FRAME_SAMPLES
-                        )
-                    )
-
-                else:
-
-                    background = np.zeros(
-                        AUDIO_FRAME_SAMPLES,
-                        dtype=np.float32,
-                    )
-
-                # =================================================
-                # GET NEXT TTS WHEN CURRENT TTS ENDS
-                # =================================================
-
-                if (
-                    current_tts_position
-                    >= len(current_tts)
-                ):
-
-                    # Tell the caller that the previous TTS
-                    # has actually finished playing.
-                    if (
-                        current_tts
-                        and current_tts_finished_event
-                    ):
-
-                        current_tts_finished_event.set()
-
-                    current_tts = b""
-                    current_tts_position = 0
-                    current_tts_finished_event = None
-
-                    # Do not block here.
-                    #
-                    # Background audio must continue even when
-                    # there is no TTS.
-                    try:
-
-                        (
-                            next_tts,
-                            finished_event,
-                        ) = (
-                            tts_audio_queue.get_nowait()
-                        )
-
-                        current_tts = next_tts
-
-                        current_tts_finished_event = (
-                            finished_event
-                        )
-
-                    except asyncio.QueueEmpty:
-
-                        pass
-
-                # =================================================
-                # MIX TTS INTO BACKGROUND
-                # =================================================
-
-                output = background.copy()
-
-                if current_tts:
-
-                    remaining_bytes = (
-                        len(current_tts)
-                        - current_tts_position
-                    )
-
-                    frame_bytes = min(
-                        AUDIO_FRAME_BYTES,
-                        remaining_bytes,
-                    )
-
-                    tts_chunk = current_tts[
-                        current_tts_position:
-                        current_tts_position
-                        + frame_bytes
-                    ]
-
-                    tts_samples = np.frombuffer(
-                        tts_chunk,
-                        dtype="<i2",
-                    ).astype(
-                        np.float32
-                    )
-
-                    output[
-                        :len(tts_samples)
-                    ] += tts_samples
-
-                    current_tts_position += (
-                        frame_bytes
-                    )
-
-                # =================================================
-                # CLIP
-                # =================================================
-
-                output = np.clip(
-                    output,
-                    -32768.0,
-                    32767.0,
-                )
-
-                # =================================================
-                # CONVERT TO RAW INT16 PCM
-                # =================================================
-
-                output_pcm = (
-                    output
-                    .astype(
-                        "<i2",
-                        copy=False,
-                    )
-                    .tobytes()
-                )
-
-                # =================================================
-                # SEND FRAME
-                # =================================================
-
-                await websocket.send_bytes(
-                    output_pcm
-                )
-
-                # =================================================
-                # REAL-TIME PACING
-                # =================================================
-
-                await asyncio.sleep(
-                    AUDIO_FRAME_DURATION
-                )
-
-            except asyncio.CancelledError:
-
-                break
-
-            except WebSocketDisconnect:
-
-                break
-
-            except Exception:
-
-                logger.exception(
-                    "[AUDIO] Continuous output loop failed"
-                )
-
-                await asyncio.sleep(
-                    AUDIO_FRAME_DURATION
-                )
-
-    # ========================================================
-    # SPEAK ONE TTS ITEM
-    # ========================================================
-
-    async def speak(
-        item_id: str,
-        text: str,
-    ):
-        """
-        Generate/load one TTS item and put it into the
-        continuous audio stream.
-
-        Background audio is NOT handled here.
-
-        `audio_output_loop()` handles the actual WebSocket
-        output and mixes TTS with the background.
-        """
-
-        nonlocal speech_active
-        nonlocal mic_muted_until
+        nonlocal speech_active, mic_muted_until
 
         if not text:
             return
 
-        conversation_logger.info(
-            "AGENT | %s",
-            text,
-        )
-
-        # ----------------------------------------------------
-        # Immediately stop accepting candidate speech.
-        # ----------------------------------------------------
-
+        # Stop accepting candidate speech immediately, before the
+        # cache lookup, so nothing said during the gap is captured.
         mic_muted_until = float("inf")
-
         speech_active = False
-
         audio_buffer.clear()
-
         vad.reset()
 
-        # ----------------------------------------------------
-        # Get cached/pre-generated TTS or synthesize dynamically.
-        # ----------------------------------------------------
-
-        task = tts_tasks.get(
-            item_id
-        )
+        task = tts_tasks.get(item_id)
 
         try:
 
             if task is not None:
-
-                logger.info(
-                    "[TTS] Awaiting cached/pre-generated item: %s",
-                    item_id,
-                )
-
-                audio, sample_rate = (
-                    await task
-                )
+                audio, sample_rate = await task
 
             else:
-
-                logger.info(
-                    "[TTS] Synthesizing dynamic item: %s",
+                # Shouldn't happen in this mode — every clip is
+                # pre-generated — but don't go silent if it does.
+                logger.warning(
+                    "[TTS] No pre-generated clip for %s, "
+                    "synthesizing on demand",
                     item_id,
                 )
+                audio, sample_rate = await tts.synthesize(text)
 
-                audio, sample_rate = (
-                    await tts.synthesize(
-                        text
-                    )
-                )
+            duration_s = len(audio) / (sample_rate * 2)
 
-            # ------------------------------------------------
-            # Validate audio format.
-            # ------------------------------------------------
-
-            _validate_tts_audio(
-                audio,
-                sample_rate,
-                item_id,
-            )
-
-            duration_s = (
-                len(audio)
-                / (
-                    sample_rate
-                    * TTS_SAMPLE_WIDTH
-                )
-            )
+            mic_muted_until = time.monotonic() + duration_s
 
             logger.info(
-                "[TTS] Queueing %s | %.2fs | %d bytes",
+                "[TTS] Sending %s | %.2fs | %d bytes",
                 item_id,
                 duration_s,
                 len(audio),
             )
-
-            # ------------------------------------------------
-            # Tell client TTS is beginning.
-            #
-            # This does NOT mean the server starts sending
-            # audio directly here.
-            # The continuous audio stream is already running.
-            # ------------------------------------------------
 
             await websocket.send_json({
                 "type": "tts_start",
@@ -904,378 +289,138 @@ async def websocket_endpoint(
                 "channels": 1,
             })
 
-            # ------------------------------------------------
-            # Create completion event.
-            #
-            # This event is set by audio_output_loop() only
-            # AFTER the audio has actually been played through
-            # the outgoing stream.
-            # ------------------------------------------------
-
-            playback_finished = (
-                asyncio.Event()
-            )
-
-            await tts_audio_queue.put(
-                (
-                    audio,
-                    playback_finished,
+            for offset in range(0, len(audio), TTS_SEND_CHUNK_SIZE):
+                await websocket.send_bytes(
+                    audio[offset:offset + TTS_SEND_CHUNK_SIZE]
                 )
-            )
 
-            # ------------------------------------------------
-            # Wait for actual playback completion.
-            # ------------------------------------------------
-
-            await playback_finished.wait()
-
-            # ------------------------------------------------
-            # TTS has actually finished.
-            # ------------------------------------------------
-
-            mic_muted_until = (
-                time.monotonic()
-            )
-
-            await websocket.send_json({
-                "type": "tts_end",
-            })
-
-            logger.info(
-                "[TTS] Finished playback: %s",
-                item_id,
-            )
+            await websocket.send_json({"type": "tts_end"})
 
         except WebSocketDisconnect:
-
             raise
 
         except Exception as e:
 
             mic_muted_until = 0.0
 
-            logger.exception(
-                "[TTS] Failed to speak %s",
-                item_id,
-            )
+            logger.exception("[TTS] Failed to speak %s", item_id)
 
             try:
-
                 await websocket.send_json({
                     "type": "error",
                     "stage": "tts",
                     "message": str(e),
                 })
-
             except WebSocketDisconnect:
-
                 raise
 
     # ========================================================
-    # SPEAK RETRY
+    # SPEAK THE CURRENT PROMPT
     # ========================================================
 
-    async def speak_retry(
-        retry_id: str,
-        question: dict,
-    ):
+    async def speak_prompt():
         """
-        Speak:
+        Speak whatever the graph decided to say next, plus — when
+        applicable — a short cached lead-in before it. Each piece is
+        its own cached clip, spoken back to back.
 
-            retry message
-                ↓
-            original question
-
-        Both remain separate TTS items.
+        Safe as consecutive speak() calls: nothing between them
+        awaits websocket.receive(), so mic muting stays continuous
+        (each call pushes mic_muted_until forward before the loop
+        can read audio again).
         """
 
-        retry_message = (
-            retry_messages.get(
-                retry_id
-            )
-        )
+        prompt = state.get("current_prompt")
 
-        if retry_message is None:
-
-            logger.error(
-                "[TTS] Retry message '%s' "
-                "does not exist in questions.json",
-                retry_id,
-            )
-
-            await speak(
-                question["id"],
-                question["question_ar"],
-            )
-
+        if not prompt:
             return
 
-        # ----------------------------------------------------
-        # 1. Retry clarification
-        # ----------------------------------------------------
+        # One-off "let me ask about what's missing" line, only on
+        # the first follow-up after the intro paragraph.
+        if state.get("first_followup"):
 
-        await speak(
-            retry_message["id"],
-            retry_message["question_ar"],
-        )
+            lead_in = interview_manager.get_system_message(
+                BEFORE_FOLLOWUPS_ID
+            )
 
-        # ----------------------------------------------------
-        # 2. Original question
-        # ----------------------------------------------------
+            if lead_in:
+                await speak(BEFORE_FOLLOWUPS_ID, lead_in)
 
-        await speak(
-            question["id"],
-            question["question_ar"],
-        )
+        await websocket.send_json({
+            "type": "question",
+            "id": prompt["id"],
+            "text": prompt["text"],
+            "field": state.get("current_field"),
+            "repeat": False,
+        })
+
+        await speak(prompt["id"], prompt["text"])
 
     # ========================================================
-    # HANDLE INVALID ANSWER
+    # RETRY
     # ========================================================
 
-    async def handle_invalid_answer():
+    async def speak_retry():
         """
-        Handle a failed interview answer.
-
-        no_speech:
-            no_speech_retry -> original question
-
-        wrong_answer:
-            wrong_answer_retry -> original question
-
-        Summary failures:
-            repeat summary
+        Clarification line + the same prompt again. Both are
+        separate cached clips, so a retry costs zero VoiceTut calls.
         """
 
-        current_question = (
-            state.get(
-                "current_question"
-            )
-        )
+        prompt = state.get("current_prompt")
 
-        if current_question is None:
+        if not prompt:
             return
 
-        # ----------------------------------------------------
-        # SUMMARY
-        # ----------------------------------------------------
+        failure_reason = state.get("failure_reason")
 
-        if state.get("mode") == "summary":
-
-            logger.info(
-                "[INTERVIEW] Repeating summary"
-            )
-
-            await speak(
-                current_question["id"],
-                current_question[
-                    "question_ar"
-                ],
-            )
-
-            return
-
-        # ----------------------------------------------------
-        # NORMAL QUESTION
-        # ----------------------------------------------------
-
-        failure_reason = state.get(
-            "failure_reason"
+        retry_id = (
+            WRONG_ANSWER_RETRY_ID
+            if failure_reason == "wrong_answer"
+            else NO_SPEECH_RETRY_ID
         )
-
-        if (
-            failure_reason
-            == "wrong_answer"
-        ):
-
-            retry_id = (
-                "wrong_answer_retry"
-            )
-
-        else:
-
-            retry_id = (
-                "no_speech_retry"
-            )
 
         logger.info(
-            "[INTERVIEW] Retry | "
-            "question=%s | reason=%s | retry_id=%s",
-            current_question["id"],
+            "[INTERVIEW] Retry | prompt=%s | reason=%s",
+            prompt["id"],
             failure_reason,
-            retry_id,
         )
 
         await websocket.send_json({
             "type": "answer_not_understood",
-            "question_id": (
-                current_question["id"]
-            ),
-            "failure_reason": (
-                failure_reason
-            ),
+            "question_id": prompt["id"],
+            "failure_reason": failure_reason,
         })
+
+        retry_text = interview_manager.get_system_message(retry_id)
+
+        if retry_text:
+            await speak(retry_id, retry_text)
 
         await websocket.send_json({
             "type": "question",
-            "id": current_question["id"],
-            "text": current_question[
-                "question_ar"
-            ],
-            "is_welcome": False,
+            "id": prompt["id"],
+            "text": prompt["text"],
+            "field": state.get("current_field"),
             "repeat": True,
-            "failure_reason": (
-                failure_reason
-            ),
         })
 
-        await speak_retry(
-            retry_id,
-            current_question,
-        )
+        await speak(prompt["id"], prompt["text"])
 
     # ========================================================
-    # START CONTINUOUS AUDIO OUTPUT
-    # ========================================================
-    #
-    # IMPORTANT:
-    #
-    # This starts BEFORE the welcome TTS.
-    #
-    # Therefore the background exists for the whole call,
-    # not only while TTS is playing.
-
-    audio_output_task = asyncio.create_task(
-        audio_output_loop()
-    )
-
-    # ========================================================
-    # START SESSION
+    # SESSION
     # ========================================================
 
     try:
 
-        logger.info(
-            "[INTERVIEW] Starting interview"
-        )
+        logger.info("[INTERVIEW] Starting (one-paragraph mode)")
 
-        # ====================================================
-        # WELCOME
-        # ====================================================
+        # ----------------------------------------------------
+        # INTRO — one graph call with no transcript sets it up.
+        # ----------------------------------------------------
 
-        welcome_question = (
-            interview_manager.get_question(
-                0
-            )
-        )
+        state = await agent_graph.ainvoke(state)
 
-        if welcome_question is None:
-
-            logger.error(
-                "[INTERVIEW] "
-                "Welcome question not found"
-            )
-
-            await websocket.send_json({
-                "type": "interview_complete",
-            })
-
-            return
-
-        state[
-            "current_question_index"
-        ] = 0
-
-        state[
-            "current_question"
-        ] = welcome_question
-
-        state["response"] = (
-            welcome_question[
-                "question_ar"
-            ]
-        )
-
-        await websocket.send_json({
-            "type": "question",
-            "id": welcome_question[
-                "id"
-            ],
-            "text": welcome_question[
-                "question_ar"
-            ],
-            "is_welcome": True,
-        })
-
-        await speak(
-            welcome_question["id"],
-            welcome_question[
-                "question_ar"
-            ],
-        )
-
-        # ====================================================
-        # FIRST QUESTION
-        # ====================================================
-
-        first_question_index = 1
-
-        first_question = (
-            interview_manager.get_question(
-                first_question_index
-            )
-        )
-
-        if first_question is None:
-
-            logger.error(
-                "[INTERVIEW] "
-                "No first interview question found"
-            )
-
-            await websocket.send_json({
-                "type": "interview_complete",
-            })
-
-            return
-
-        state[
-            "current_question_index"
-        ] = first_question_index
-
-        state[
-            "current_question"
-        ] = first_question
-
-        state["response"] = (
-            first_question[
-                "question_ar"
-            ]
-        )
-
-        state["transcript"] = ""
-
-        state[
-            "extraction_success"
-        ] = False
-
-        await websocket.send_json({
-            "type": "question",
-            "id": first_question[
-                "id"
-            ],
-            "text": first_question[
-                "question_ar"
-            ],
-            "is_welcome": False,
-            "repeat": False,
-        })
-
-        await speak(
-            first_question["id"],
-            first_question[
-                "question_ar"
-            ],
-        )
+        await speak_prompt()
 
         # ====================================================
         # AUDIO LOOP
@@ -1283,122 +428,55 @@ async def websocket_endpoint(
 
         while True:
 
-            message = (
-                await websocket.receive()
-            )
+            message = await websocket.receive()
 
-            # =================================================
+            # -------------------------------------------------
             # TEXT MESSAGE
-            # =================================================
+            # -------------------------------------------------
 
-            if (
-                message.get("text")
-                is not None
-            ):
-
-                text = message[
-                    "text"
-                ]
-
-                logger.info(
-                    "[WS] Received text: %s",
-                    text,
-                )
+            if message.get("text") is not None:
 
                 await websocket.send_json({
-                    "type": (
-                        "message_received"
-                    ),
-                    "message": text,
+                    "type": "message_received",
+                    "message": message["text"],
                 })
 
                 continue
 
-            # =================================================
+            # -------------------------------------------------
             # AUDIO MESSAGE
-            # =================================================
+            # -------------------------------------------------
 
-            audio_data = message.get(
-                "bytes"
-            )
+            audio_data = message.get("bytes")
 
             if not audio_data:
                 continue
 
-            # =================================================
-            # IGNORE AUDIO WHILE BOT SPEAKS
-            # =================================================
-
-            if (
-                time.monotonic()
-                < mic_muted_until
-            ):
-
+            if time.monotonic() < mic_muted_until:
                 continue
 
-            # =================================================
-            # RESAMPLE 24kHz -> 16kHz
-            # =================================================
+            audio = pcm16_to_float32(audio_data)
+            audio = resampler.process(audio)
+            normalized_audio = float32_to_pcm16(audio)
 
-            audio = (
-                pcm16_to_float32(
-                    audio_data
-                )
-            )
-
-            audio = resampler.process(
-                audio
-            )
-
-            normalized_audio = (
-                float32_to_pcm16(
-                    audio
-                )
-            )
-
-            # =================================================
-            # VAD
-            # =================================================
-
-            vad_events = vad.process(
-                normalized_audio
-            )
-
-            # -------------------------------------------------
-            # SPEECH START
-            # -------------------------------------------------
+            vad_events = vad.process(normalized_audio)
 
             for event in vad_events:
 
                 if event == "speech_start":
 
-                    logger.info(
-                        "[VAD] Speech started"
-                    )
+                    logger.info("[VAD] Speech started")
 
                     speech_active = True
 
                     audio_buffer.clear()
 
                     await websocket.send_json({
-                        "type": (
-                            "speech_started"
-                        ),
+                        "type": "speech_started"
                     })
 
-            # -------------------------------------------------
-            # BUFFER CURRENT CHUNK
-            # -------------------------------------------------
-
             if speech_active:
-
-                audio_buffer.add(
-                    normalized_audio
-                )
-
-            # -------------------------------------------------
-            # SPEECH END
-            # -------------------------------------------------
+                audio_buffer.add(normalized_audio)
 
             for event in vad_events:
 
@@ -1406,32 +484,23 @@ async def websocket_endpoint(
                     continue
 
                 logger.info(
-                    "[VAD] Speech ended | "
-                    "Audio: %d bytes",
+                    "[VAD] Speech ended | Audio: %d bytes",
                     audio_buffer.size(),
                 )
 
                 speech_active = False
 
-                utterance = (
-                    audio_buffer.get_audio()
-                )
+                utterance = audio_buffer.get_audio()
 
                 await websocket.send_json({
-                    "type": (
-                        "speech_ended"
-                    ),
-                    "bytes": len(
-                        utterance
-                    ),
-                    "sample_rate": (
-                        TARGET_SAMPLE_RATE
-                    ),
+                    "type": "speech_ended",
+                    "bytes": len(utterance),
+                    "sample_rate": TARGET_SAMPLE_RATE,
                 })
 
-                # =============================================
+                # =========================================
                 # STT
-                # =============================================
+                # =========================================
 
                 transcript = ""
 
@@ -1439,31 +508,19 @@ async def websocket_endpoint(
 
                     try:
 
-                        transcript = (
-                            await stt.transcribe(
-                                audio_bytes=(
-                                    utterance
-                                ),
-                                sample_rate=(
-                                    TARGET_SAMPLE_RATE
-                                ),
-                            )
+                        transcript = await stt.transcribe(
+                            audio_bytes=utterance,
+                            sample_rate=TARGET_SAMPLE_RATE,
                         )
 
-                        transcript = (
-                            transcript.strip()
-                        )
+                        transcript = transcript.strip()
 
                     except WebSocketDisconnect:
-
                         raise
 
                     except Exception as e:
 
-                        logger.exception(
-                            "[STT] "
-                            "Transcription failed"
-                        )
+                        logger.exception("[STT] Transcription failed")
 
                         await websocket.send_json({
                             "type": "error",
@@ -1478,8 +535,7 @@ async def websocket_endpoint(
 
                 logger.info(
                     "[STT] Transcript: %s",
-                    transcript
-                    or "<EMPTY>",
+                    transcript or "<EMPTY>",
                 )
 
                 await websocket.send_json({
@@ -1487,309 +543,143 @@ async def websocket_endpoint(
                     "text": transcript,
                 })
 
-                conversation_logger.info(
-                    "CANDIDATE | %s",
-                    transcript,
+                # =========================================
+                # SAVE THE ANSWER RECORDING
+                # =========================================
+                # Before any branching, so rejected and
+                # untranscribable answers are captured too —
+                # those are the ones worth listening back to.
+
+                prompt = state.get("current_prompt")
+
+                recording_path = await recorder.save(
+                    audio=utterance,
+                    sample_rate=TARGET_SAMPLE_RATE,
+                    question_id=prompt["id"] if prompt else "unknown",
+                    transcript=transcript,
                 )
 
-                # =============================================
+                if recording_path:
+                    logger.info(
+                        "[RECORD] Saved answer audio: %s",
+                        recording_path,
+                    )
+
+                # =========================================
                 # EMPTY TRANSCRIPT
-                # =============================================
-                #
-                # Empty STT result means:
-                #
-                #     no usable speech detected
-                #
-                # It must still trigger the retry flow.
+                # =========================================
+                # Nothing usable was heard — always a no_speech
+                # retry, handled without invoking the graph (there
+                # is nothing for the LLM to reason about, and an
+                # empty transcript would route back to "start" and
+                # reset the whole interview).
 
                 if not transcript:
 
-                    state[
-                        "failure_reason"
-                    ] = "no_speech"
+                    state["failure_reason"] = "no_speech"
+                    state["extraction_success"] = False
 
-                    state[
-                        "extraction_success"
-                    ] = False
-
-                    await handle_invalid_answer()
+                    await speak_retry()
 
                     audio_buffer.clear()
                     vad.reset()
 
                     continue
 
-                # =============================================
+                # =========================================
                 # LANGGRAPH
-                # =============================================
+                # =========================================
 
                 try:
 
-                    state[
-                        "transcript"
-                    ] = transcript
-
-                    state[
-                        "extraction_success"
-                    ] = False
+                    state["transcript"] = transcript
 
                     logger.info(
-                        "[AGENT] Processing answer | "
-                        "question=%s",
-                        state[
-                            "current_question"
-                        ]["id"],
+                        "[AGENT] Processing | mode=%s | field=%s",
+                        state.get("mode"),
+                        state.get("current_field"),
                     )
 
-                    result = (
-                        await agent_graph.ainvoke(
-                            state
-                        )
-                    )
-
-                    state = result
+                    state = await agent_graph.ainvoke(state)
 
                     logger.info(
                         "[AGENT] Candidate: %s",
-                        state[
-                            "candidate"
-                        ],
+                        state["candidate"],
                     )
 
-                    logger.info(
-                        "[AGENT] "
-                        "Extraction success: %s",
-                        state[
-                            "extraction_success"
-                        ],
-                    )
+                    # -------------------------------------
+                    # REJECTED ANSWER
+                    # -------------------------------------
 
-                    # =========================================
-                    # WAITING FOR SUMMARY
-                    # =========================================
+                    if not state["extraction_success"]:
 
-                    if (
-                        state.get("mode")
-                        == "waiting_for_summary"
-                    ):
-
-                        waiting_message = (
-                            state[
-                                "current_question"
-                            ]
-                        )
-
-                        logger.info(
-                            "[INTERVIEW] "
-                            "Waiting before summary"
-                        )
-
-                        await websocket.send_json({
-                            "type": (
-                                "system_message"
-                            ),
-                            "id": (
-                                waiting_message[
-                                    "id"
-                                ]
-                            ),
-                            "text": (
-                                waiting_message[
-                                    "question_ar"
-                                ]
-                            ),
-                        })
-
-                        await speak(
-                            waiting_message[
-                                "id"
-                            ],
-                            waiting_message[
-                                "question_ar"
-                            ],
-                        )
-
-                        # Tell the graph what we want
-                        # to do next.
-
-                        state[
-                            "mode"
-                        ] = (
-                            "building_summary"
-                        )
-
-                        state[
-                            "current_question"
-                        ] = None
-
-                        state[
-                            "transcript"
-                        ] = ""
-
-                        state[
-                            "extraction_success"
-                        ] = False
-
-                        state[
-                            "failure_reason"
-                        ] = None
-
-                        result = (
-                            await agent_graph.ainvoke(
-                                state
-                            )
-                        )
-
-                        state = result
-
-                    # =========================================
-                    # INVALID ANSWER
-                    # =========================================
-
-                    if not state[
-                        "extraction_success"
-                    ]:
-
-                        await handle_invalid_answer()
+                        await speak_retry()
 
                         audio_buffer.clear()
                         vad.reset()
 
                         continue
 
-                    # =========================================
-                    # INTERVIEW FINISHED
-                    # =========================================
+                    # -------------------------------------
+                    # PAST THE INTRO — shorter answers now,
+                    # so end turns on a shorter pause.
+                    # -------------------------------------
 
-                    if state[
-                        "interview_finished"
-                    ]:
+                    vad.set_min_silence(FOLLOWUP_SILENCE_MS)
+
+                    # -------------------------------------
+                    # FINISHED
+                    # -------------------------------------
+
+                    if state["interview_finished"]:
 
                         logger.info(
-                            "[INTERVIEW] "
-                            "Interview completed"
+                            "[INTERVIEW] Complete | candidate: %s",
+                            state["candidate"],
                         )
-
-                        logger.info(
-                            "[INTERVIEW] "
-                            "Final candidate data: %s",
-                            state[
-                                "candidate"
-                            ],
-                        )
-
-                        # -------------------------------------
-                        # Save candidate data
-                        # -------------------------------------
 
                         try:
 
-                            saved_path = (
-                                await asyncio.to_thread(
-                                    _write_candidate_json,
-                                    state[
-                                        "candidate"
-                                    ],
-                                    session_id,
-                                )
+                            saved_path = await asyncio.to_thread(
+                                _write_candidate_json,
+                                state["candidate"],
+                                session_id,
                             )
 
                             logger.info(
-                                "[INTERVIEW] "
-                                "Saved candidate data: %s",
+                                "[INTERVIEW] Saved candidate data: %s",
                                 saved_path,
                             )
 
                         except Exception:
 
                             logger.exception(
-                                "[INTERVIEW] "
-                                "Failed to save "
+                                "[INTERVIEW] Failed to save "
                                 "candidate data"
                             )
 
-                        # -------------------------------------
-                        # Tell client interview is complete
-                        # -------------------------------------
-
                         await websocket.send_json({
-                            "type": (
-                                "interview_complete"
-                            ),
-                            "candidate": (
-                                state[
-                                    "candidate"
-                                ]
-                            ),
+                            "type": "interview_complete",
+                            "candidate": state["candidate"],
                         })
 
-                        # -------------------------------------
-                        # Goodbye
-                        # -------------------------------------
-
-                        await speak(
-                            GOODBYE_ID,
-                            GOODBYE_MESSAGE,
-                        )
+                        # Completion line is a normal cached clip.
+                        await speak_prompt()
 
                         return
 
-                    # =========================================
-                    # NEXT QUESTION
-                    # =========================================
+                    # -------------------------------------
+                    # NEXT MISSING FIELD
+                    # -------------------------------------
 
-                    next_question = (
-                        state.get(
-                            "current_question"
-                        )
-                    )
-
-                    if next_question is not None:
-
-                        logger.info(
-                            "[INTERVIEW] "
-                            "Next question: %s",
-                            next_question[
-                                "id"
-                            ],
-                        )
-
-                        await websocket.send_json({
-                            "type": (
-                                "question"
-                            ),
-                            "id": (
-                                next_question[
-                                    "id"
-                                ]
-                            ),
-                            "text": (
-                                next_question[
-                                    "question_ar"
-                                ]
-                            ),
-                            "is_welcome": False,
-                            "repeat": False,
-                        })
-
-                        await speak(
-                            next_question[
-                                "id"
-                            ],
-                            next_question[
-                                "question_ar"
-                            ],
-                        )
+                    await speak_prompt()
 
                 except WebSocketDisconnect:
-
                     raise
 
                 except Exception as e:
 
-                    logger.exception(
-                        "[AGENT] Processing failed"
-                    )
+                    logger.exception("[AGENT] Processing failed")
 
                     await websocket.send_json({
                         "type": "error",
@@ -1797,75 +687,29 @@ async def websocket_endpoint(
                         "message": str(e),
                     })
 
-                # ---------------------------------------------
-                # CLEAN UP UTTERANCE
-                # ---------------------------------------------
-
                 audio_buffer.clear()
 
                 vad.reset()
 
-                # Do NOT reset the resampler here.
-                #
-                # It must remain continuous across the entire
-                # microphone stream.
+                # Do NOT reset the resampler — it must stay
+                # continuous across the whole microphone stream.
 
     except WebSocketDisconnect:
 
-        logger.info(
-            "[WS] Client disconnected"
-        )
+        logger.info("[WS] Client disconnected")
 
     except RuntimeError as e:
 
         if "disconnect message" in str(e):
-
-            logger.info(
-                "[WS] Client disconnected"
-            )
+            logger.info("[WS] Client disconnected")
 
         else:
-
             raise
 
     finally:
 
-        # ====================================================
-        # STOP CONTINUOUS AUDIO
-        # ====================================================
-
-        audio_output_running = False
-
-        if audio_output_task:
-
-            audio_output_task.cancel()
-
-            try:
-
-                await audio_output_task
-
-            except asyncio.CancelledError:
-
-                pass
-
-        # ====================================================
-        # CANCEL UNUSED TTS PRE-GENERATION
-        # ====================================================
-
         for task in tts_tasks.values():
-
             if not task.done():
-
                 task.cancel()
 
-        # ====================================================
-        # CLEANUP
-        # ====================================================
-
-        logger.info(
-            "[WS] Connection closed"
-        )
-
-        conversation_logger.info(
-            "========== CALL ENDED =========="
-        )
+        logger.info("[WS] Connection closed")

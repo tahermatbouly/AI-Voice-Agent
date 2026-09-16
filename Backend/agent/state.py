@@ -1,51 +1,46 @@
-from typing import Literal, TypedDict
-
-
-class CandidateInfo(TypedDict, total=False):
-    candidate_name: str
-    target_domain: str
-    years_of_experience: str
-    education_level: str
-    key_skills: list[str]
-    tools_technologies: list[str]
-    english_proficiency: str
+from typing import Any, Literal, TypedDict
 
 
 class AgentState(TypedDict):
+    """
+    Every key here must be declared — LangGraph builds its state
+    channels from this TypedDict, and any key a node returns that
+    isn't listed gets silently dropped on the merge.
+    """
+
     transcript: str
 
-    candidate: CandidateInfo
+    # Collected answers. Keys are the "name" values from
+    # questions.json, so this is a plain dict rather than a fixed
+    # TypedDict — the field set is config-driven now.
+    candidate: dict[str, Any]
 
-    questions: list[dict]
+    # "intro"    — waiting for / processing the opening paragraph
+    # "filling"  — asking one missing field at a time
+    # "finished" — everything required collected
+    mode: Literal["intro", "filling", "finished"]
 
-    current_question_index: int
+    # Name of the field currently being asked about. None during
+    # the intro turn.
+    current_field: str | None
 
-    current_question: dict | None
+    # The clip to speak next: {"id": ..., "text": ...}. handler.py
+    # speaks this by id, so it's always a cache hit.
+    current_prompt: dict | None
 
-    response: str
-
-    interview_finished: bool
-
+    # True when the last turn produced at least one new value.
     extraction_success: bool
 
-    # Why the last answer was rejected: "no_speech" (no usable
-    # transcript) or "wrong_answer" (real speech, wrong question).
-    # None when there's nothing to report (success, or before the
-    # first answer). Without this declared here, LangGraph has no
-    # channel for it — any node returning it gets the value silently
-    # dropped on the merge, which is why repeat_question() was always
-    # falling back to its "no_speech" default.
+    # Why the last turn produced nothing: "no_speech" (nothing
+    # usable was transcribed) or "wrong_answer" (real speech that
+    # didn't answer what was asked). None on success.
     failure_reason: Literal["no_speech", "wrong_answer"] | None
 
-    # Which phase of the conversation we're in — drives routing in
-    # graph.py. "interview": walking through questions.json normally.
-    # "summary": the candidate is replying to the spoken summary.
-    # "correcting": they asked to change one field and are now
-    # re-answering that specific question.
-    mode: Literal[
-    "interview",
-    "summary",
-    "correcting",
-    "waiting_for_summary",
-    "building_summary",
-]
+    # Set once, at the very end. handler.py saves the JSON and
+    # speaks the completion line when it sees this.
+    interview_finished: bool
+
+    # True only on the follow-up prompt immediately after the intro
+    # paragraph, so handler.py knows to play the one-off
+    # "let me ask about what's missing" line before it.
+    first_followup: bool

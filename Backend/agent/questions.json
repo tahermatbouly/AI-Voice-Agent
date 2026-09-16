@@ -1,55 +1,93 @@
-[
-  {
-    "id": "welcome",
-    "question_ar": "مساء الخير، مع حَضْرِتَكْ محمد مَسْؤُولَ التوظيف في شركة gb corp. بَعْرِضْ لحَضْرِتَكْ أَفضل فرص العمل المناسبة لِيكْ عندنا.",
-    "is_welcome": true
+{
+  "mode": "one_paragraph",
+
+  "intro": {
+    "text": "مساء الخير، مع حَضْرِتَكْ محمد مَسْؤُولَ التوظيف في شركة gb corp. بدل ما نمشي سؤال بسؤال، ممكن تقولي كل المعلومات عن حضرتك مرة واحدة، زي اسمك، المجال اللي بتدور عليه، خبرتك، مؤهلك الدراسي، المهارات والأدوات اللي بتستخدمها، ومستواك في الإنجليزي. وبعد ما تخلص، هسألك بس عن أي معلومات ناقصة."
   },
-  {
-    "id": "q1_name",
-    "question_ar": "ممكن أعرف اسم حضرتك بالكامل؟",
-    "target_field": "candidate_name"
+
+  "fields": [
+    {
+      "name": "candidate_name",
+      "required": true,
+      "multi": false,
+      "label": "الاسم",
+      "description": "The candidate's full name.",
+      "question": "ممكن أعرف اسم حضرتك بالكامل؟"
+    },
+    {
+      "name": "target_domain",
+      "required": true,
+      "multi": false,
+      "label": "المجال أو الشغلانة",
+      "description": "The field, domain or job the candidate is looking for.",
+      "question": "إيه المجال أو الشغلانة اللي بتدور عليها؟"
+    },
+    {
+      "name": "years_of_experience",
+      "required": true,
+      "multi": false,
+      "label": "سنين الخبرة",
+      "description": "Years of relevant professional experience. Zero is a valid answer for a fresh graduate.",
+      "question": "عندك كام سنة خبرة في المجال ده؟"
+    },
+    {
+      "name": "education_level",
+      "required": true,
+      "multi": false,
+      "label": "المؤهل الدراسي",
+      "description": "The candidate's degree, study field or highest qualification.",
+      "question": "إيه مؤهلك الدراسي أو أعلى شهادة معاك؟"
+    },
+    {
+      "name": "key_skills",
+      "required": true,
+      "multi": true,
+      "label": "المهارات",
+      "description": "Skills and programming languages, each one a separate item.",
+      "question": "إيه أهم المهارات اللي عندك؟"
+    },
+    {
+      "name": "tools_technologies",
+      "required": false,
+      "multi": true,
+      "label": "الأدوات والبرامج",
+      "description": "Tools, frameworks and software used, each one a separate item.",
+      "question": "إيه الأدوات والبرامج اللي بتستخدمها باستمرار؟"
+    },
+    {
+      "name": "english_proficiency",
+      "required": true,
+      "multi": false,
+      "label": "مستوى الإنجليزي",
+      "description": "The candidate's English level, especially reading and writing.",
+      "question": "مستواك إيه في الإنجليزي، خصوصًا في القراءة والكتابة؟"
+    },
+    {
+      "name": "notes",
+      "required": false,
+      "multi": false,
+      "label": "ملاحظات",
+      "description": "Any other relevant information the candidate mentioned.",
+      "question": null
+    }
+  ],
+
+  "completion": {
+    "text": "تمام، شكراً جزيلاً لوقت حضرتك. كده عندي كل المعلومات المطلوبة، وهنتواصل معاك قريب. مع السلامة."
   },
-  {
-    "id": "q2_domain",
-    "question_ar": "إيه المجال أو الشغلانة اللي بتدور عليها؟",
-    "target_field": "target_domain"
-  },
-  {
-    "id": "q3_experience",
-    "question_ar": "عندك كام سنة خبرة في المجال ده؟",
-    "target_field": "years_of_experience"
-  },
-  {
-    "id": "q4_education",
-    "question_ar": "إيه مؤهلك الدراسي أو أعلى شهادة معاك؟",
-    "target_field": "education_level"
-  },
-  {
-    "id": "q5_skills_tools",
-    "question_ar": "إيه أهم المهارات والبرامج أو الأدوات اللي بتستخدمها باستمرار؟",
-    "target_fields": [
-      "key_skills",
-      "tools_technologies"
-    ]
-  },
-  {
-    "id": "q6_english",
-    "question_ar": "مستواك إيه في الإنجليزي، خصوصًا في القراءة والكتابة؟",
-    "target_field": "english_proficiency"
-  },
-  {
-    "id": "no_speech_retry",
-    "question_ar": "معلش، مسمعتش حضرتك كويس. ",
-    "type": "system_message"
-  },
-  {
-    "id": "wrong_answer_retry",
-    "question_ar": "معلش، الإجابة دي مش بتجاوب على السؤال ده. ",
-    "type": "system_message"
-  },
-  {
-    "id":"waiting_for_summary",
-    "question_ar":"تمام, دقيقة واحدة اسجل البيانات و اراجعها مع حضرتك",
-    "type":"system_message"
-  }
-]
+
+  "system_messages": [
+    {
+      "id": "before_followups",
+      "text": "تمام، شكراً ليك. خليني بس أسأل حضرتك على شوية حاجات ناقصة."
+    },
+    {
+      "id": "no_speech_retry",
+      "text": "معلش، مسمعتش حضرتك كويس."
+    },
+    {
+      "id": "wrong_answer_retry",
+      "text": "معلش، الإجابة دي مش بتجاوب على السؤال ده."
+    }
+  ]
+}

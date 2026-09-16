@@ -2,7 +2,35 @@ import json
 from pathlib import Path
 
 
+# Ids for the non-field spoken items. Kept here (not in the JSON)
+# because the code refers to them directly — the JSON only supplies
+# their text.
+INTRO_ID = "intro"
+COMPLETION_ID = "completion"
+BEFORE_FOLLOWUPS_ID = "before_followups"
+NO_SPEECH_RETRY_ID = "no_speech_retry"
+WRONG_ANSWER_RETRY_ID = "wrong_answer_retry"
+
+
+def field_prompt_id(field_name: str) -> str:
+    """
+    The TTS cache id for a single field's follow-up question.
+    Derived from the field name so it's stable across runs and
+    never collides with intro/completion/system message ids.
+    """
+    return f"ask_{field_name}"
+
+
 class InterviewManager:
+    """
+    Loads the one-paragraph interview config.
+
+    Everything spoken by the agent is a static item with a stable
+    id, EXCEPT nothing — in this mode there is no dynamically built
+    text at all, so every single clip can be pre-generated and
+    cached once, ever. (The old per-candidate summary paragraph was
+    the only thing that couldn't be, and it's gone.)
+    """
 
     def __init__(self, questions_path: str):
 
@@ -14,66 +42,109 @@ class InterviewManager:
             encoding="utf-8",
         ) as file:
 
-            self.questions = json.load(file)
+            config = json.load(file)
 
-        # ----------------------------------------------------
-        # Separate real interview questions from system
-        # messages.
-        # ----------------------------------------------------
+        self.mode = config.get("mode", "one_paragraph")
 
-        self.interview_questions = [
-            question
-            for question in self.questions
-            if question.get("type") != "system_message"
-        ]
+        self.intro_text = config["intro"]["text"]
+
+        self.completion_text = config["completion"]["text"]
+
+        self.fields = config["fields"]
 
         self.system_messages = {
-            question["id"]: question
-            for question in self.questions
-            if question.get("type") == "system_message"
+            item["id"]: item["text"]
+            for item in config.get("system_messages", [])
+        }
+
+        self._fields_by_name = {
+            field["name"]: field
+            for field in self.fields
         }
 
     # ========================================================
-    # NORMAL QUESTIONS
+    # FIELDS
     # ========================================================
 
-    def get_question(self, index: int):
+    def get_field(self, name: str) -> dict | None:
+        return self._fields_by_name.get(name)
 
-        if index < 0:
-            return None
+    def askable_fields(self) -> list[dict]:
+        """
+        Fields we can ask a follow-up question about. A field with
+        "question": null (e.g. notes) can only ever be filled from
+        the opening paragraph — we never ask for it directly.
+        """
+        return [
+            field
+            for field in self.fields
+            if field.get("question")
+        ]
 
-        if index >= len(self.interview_questions):
-            return None
+    def missing_required(self, candidate: dict) -> list[dict]:
+        """
+        Required fields still empty, in the order declared in the
+        JSON — that order is the order they'll be asked in.
 
-        return self.interview_questions[index]
+        Only fields with a question are returned: a required field
+        with no question would otherwise deadlock the interview.
+        """
 
-    def get_next_question(self, index: int):
+        missing = []
 
-        next_index = index + 1
+        for field in self.fields:
 
-        if next_index >= len(self.interview_questions):
-            return None
+            if not field.get("required"):
+                continue
 
-        return self.interview_questions[next_index]
+            if not field.get("question"):
+                continue
 
-    def is_finished(self, index: int):
+            value = candidate.get(field["name"])
 
-        return index >= len(self.interview_questions)
+            if value is None:
+                missing.append(field)
+                continue
+
+            if isinstance(value, (list, str)) and not value:
+                missing.append(field)
+
+        return missing
 
     # ========================================================
     # SYSTEM MESSAGES
     # ========================================================
 
-    def get_system_message(self, message_id: str):
-
+    def get_system_message(self, message_id: str) -> str | None:
         return self.system_messages.get(message_id)
 
     # ========================================================
-    # WAITING FOR SUMMARY
+    # TTS PRE-GENERATION
     # ========================================================
 
-    def get_waiting_for_summary(self):
+    def tts_items(self) -> list[tuple[str, str]]:
+        """
+        Every (id, text) pair the agent can ever speak, for the
+        pre-generation/cache pass in handler.py. Because this mode
+        has no dynamic text, this list is exhaustive — after the
+        first run against a given speaker, no live VoiceTut call
+        ever happens again.
+        """
 
-        return self.get_system_message(
-            "waiting_for_summary"
-        )
+        items = [
+            (INTRO_ID, self.intro_text),
+            (COMPLETION_ID, self.completion_text),
+        ]
+
+        for field in self.askable_fields():
+            items.append(
+                (
+                    field_prompt_id(field["name"]),
+                    field["question"],
+                )
+            )
+
+        for message_id, text in self.system_messages.items():
+            items.append((message_id, text))
+
+        return items
