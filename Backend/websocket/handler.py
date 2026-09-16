@@ -15,6 +15,7 @@ from Backend.audio.audio_utils import (
     StreamResampler,
 )
 from Backend.audio.buffer import AudioBuffer
+from Backend.audio.recorder import AnswerRecorder
 from Backend.audio.vad import VoiceActivityDetector
 from Backend.stt_plugin import CohereArabicSTT
 
@@ -327,6 +328,11 @@ async def websocket_endpoint(
     # ========================================================
 
     audio_buffer = AudioBuffer()
+
+    # One WAV per candidate answer, written to
+    # Backend/data/recordings/<session_id>/ alongside a manifest
+    # linking each file to its question and transcript.
+    recorder = AnswerRecorder(session_id)
 
     vad = VoiceActivityDetector()
 
@@ -1043,6 +1049,50 @@ async def websocket_endpoint(
                     "type": "transcript",
                     "text": transcript,
                 })
+
+                # =============================================
+                # SAVE THE ANSWER RECORDING
+                # =============================================
+                #
+                # Placed here, after STT but BEFORE any of the
+                # retry/graph branching below, so every utterance
+                # the candidate produces is captured — including
+                # ones that get rejected and repeated, and ones
+                # STT couldn't transcribe at all (those are
+                # exactly the recordings worth listening back to
+                # when debugging a bad transcript).
+                #
+                # The write itself runs off the event loop and
+                # never raises, so a disk problem can't interrupt
+                # a live call.
+
+                current_question_id = (
+                    state["current_question"]["id"]
+                    if state.get("current_question")
+                    else "unknown"
+                )
+
+                recording_path = await recorder.save(
+                    audio=utterance,
+                    sample_rate=TARGET_SAMPLE_RATE,
+                    question_id=current_question_id,
+                    transcript=transcript,
+                )
+
+                if recording_path:
+
+                    logger.info(
+                        "[RECORD] Saved answer audio: %s",
+                        recording_path,
+                    )
+
+                else:
+
+                    logger.warning(
+                        "[RECORD] Failed to save answer audio "
+                        "for question %s",
+                        current_question_id,
+                    )
 
                 # =============================================
                 # EMPTY TRANSCRIPT
