@@ -212,6 +212,23 @@ async def receive_messages(websocket):
                         # it.
                         bot_speaking = False
 
+                elif message_type == "turn_playback_end":
+                    # Server finished sending every clip for this
+                    # turn. Because we play each clip before reading
+                    # the next WS message, reaching here means the
+                    # whole turn has already been heard.
+                    print("[TTS] Turn playback complete — acking")
+
+                    await websocket.send(
+                        json.dumps({
+                            "type": "playback_done",
+                        })
+                    )
+
+                    bot_speaking = False
+
+                    print("[MIC] Re-armed (turn playback acked)")
+
                 elif message_type == "interview_complete":
                     print_candidate_summary(
                         data.get("candidate", {})

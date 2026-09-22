@@ -435,12 +435,17 @@ async def websocket_endpoint(
 
     mic_muted_until = 0.0
 
-    # Wall-clock time when the client's sequential TTS queue is
-    # expected to finish. Multi-segment turns (summary) send clips
-    # back-to-back, but the client plays them one after another —
-    # so mute/silence must cover the sum of durations, not only
-    # the last clip.
+    # Wall-clock estimate of when sequential client playback ends.
+    # Used as a fallback if the client never sends playback_done.
     playback_ends_at = 0.0
+
+    # True from the start of a spoken turn until the client confirms
+    # it finished playing every clip. While set, the mic stays gated
+    # and silence must not escalate — stops the summary being treated
+    # as user silence.
+    awaiting_playback_ack = False
+
+    playback_fallback_task = None
 
     silence_task = None
 
@@ -540,6 +545,15 @@ async def websocket_endpoint(
                     await task
                 )
 
+            if not audio or sample_rate <= 0:
+
+                logger.warning(
+                    "[TTS] Empty audio | %s",
+                    item_id,
+                )
+
+                return
+
             duration_s = len(audio) / (
                 sample_rate * 2
             )
@@ -575,8 +589,6 @@ async def websocket_endpoint(
                 "type": "tts_end",
             })
 
-            # Queue this clip after any playback already scheduled.
-            # Silence must not start until the whole queue finishes.
             now = time.monotonic()
             queued_start = max(now, playback_ends_at)
             playback_ends_at = (
@@ -584,13 +596,23 @@ async def websocket_endpoint(
                 + duration_s
                 + TTS_TAIL_SECONDS
             )
-            mic_muted_until = playback_ends_at
+
+            # While waiting for client ack, keep the mic hard-muted
+            # so silence cannot start mid-summary.
+            if awaiting_playback_ack:
+
+                mic_muted_until = float("inf")
+
+            else:
+
+                mic_muted_until = playback_ends_at
 
             logger.info(
                 "[TTS] Finished | %s | "
-                "playback_ends_in=%.2fs",
+                "playback_ends_in=%.2fs | awaiting_ack=%s",
                 item_id,
                 max(0.0, playback_ends_at - now),
+                awaiting_playback_ack,
             )
 
         except WebSocketDisconnect:
@@ -599,8 +621,13 @@ async def websocket_endpoint(
 
         except Exception as e:
 
-            mic_muted_until = 0.0
-            playback_ends_at = 0.0
+            # Keep prior playback queue — earlier clips may still play.
+            if not awaiting_playback_ack:
+
+                mic_muted_until = max(
+                    playback_ends_at,
+                    time.monotonic(),
+                )
 
             logger.exception(
                 "[TTS] Failed to speak | %s",
@@ -633,6 +660,98 @@ async def websocket_endpoint(
             )
 
     # ========================================================
+    # PLAYBACK ACK
+    # ========================================================
+
+    async def _cancel_playback_fallback():
+
+        nonlocal playback_fallback_task
+
+        if playback_fallback_task is None:
+
+            return
+
+        playback_fallback_task.cancel()
+
+        try:
+
+            await playback_fallback_task
+
+        except asyncio.CancelledError:
+
+            pass
+
+        playback_fallback_task = None
+
+    async def _playback_ack_fallback():
+        """
+        If the client never sends playback_done, fall back to the
+        queued duration estimate so the call cannot soft-lock.
+        """
+
+        nonlocal awaiting_playback_ack
+        nonlocal mic_muted_until
+
+        try:
+
+            while time.monotonic() < playback_ends_at:
+
+                if not awaiting_playback_ack:
+
+                    return
+
+                await asyncio.sleep(0.2)
+
+            await asyncio.sleep(1.0)
+
+            if not awaiting_playback_ack:
+
+                return
+
+            logger.warning(
+                "[TTS] playback_done not received — "
+                "falling back to duration estimate"
+            )
+
+            awaiting_playback_ack = False
+            mic_muted_until = (
+                time.monotonic() + TTS_TAIL_SECONDS
+            )
+
+        except asyncio.CancelledError:
+
+            raise
+
+    async def mark_playback_done():
+        """Client finished hearing the current agent turn."""
+
+        nonlocal awaiting_playback_ack
+        nonlocal mic_muted_until
+
+        awaiting_playback_ack = False
+        mic_muted_until = (
+            time.monotonic() + TTS_TAIL_SECONDS
+        )
+
+        await _cancel_playback_fallback()
+
+        logger.info(
+            "[TTS] Client confirmed playback done"
+        )
+
+    def bot_is_speaking() -> bool:
+
+        if awaiting_playback_ack:
+
+            return True
+
+        if mic_muted_until == float("inf"):
+
+            return True
+
+        return time.monotonic() < mic_muted_until
+
+    # ========================================================
     # SPEAK CURRENT TURN
     # ========================================================
 
@@ -640,8 +759,15 @@ async def websocket_endpoint(
         turn_state: dict,
     ):
 
-        # Never let a silence nudge overlap agent speech.
+        nonlocal awaiting_playback_ack
+        nonlocal mic_muted_until
+        nonlocal playback_fallback_task
+
         await stop_silence_timer()
+        await _cancel_playback_fallback()
+
+        awaiting_playback_ack = True
+        mic_muted_until = float("inf")
 
         question = (
             turn_state.get(
@@ -668,12 +794,6 @@ async def websocket_endpoint(
             or []
         )
 
-        if intent_prompt:
-
-            await speak_segments(
-                intent_prompt
-            )
-
         current_prompt = (
             turn_state.get(
                 "current_prompt"
@@ -681,15 +801,45 @@ async def websocket_endpoint(
             or []
         )
 
+        spoke_anything = False
+
+        if intent_prompt:
+
+            spoke_anything = True
+
+            await speak_segments(
+                intent_prompt
+            )
+
         if current_prompt:
+
+            spoke_anything = True
 
             await speak_segments(
                 current_prompt
             )
 
-        # Agent has finished *sending*; wait until the client has
-        # finished *hearing* before the caller starts silence.
-        await wait_until_listening()
+        if not spoke_anything:
+
+            awaiting_playback_ack = False
+            mic_muted_until = 0.0
+
+            return
+
+        await websocket.send_json({
+            "type": "turn_playback_end",
+        })
+
+        playback_fallback_task = asyncio.create_task(
+            _playback_ack_fallback()
+        )
+
+        logger.info(
+            "[TTS] Turn audio sent | "
+            "awaiting playback_done | "
+            "estimate_ends_in=%.2fs",
+            max(0.0, playback_ends_at - time.monotonic()),
+        )
 
     # ========================================================
     # SILENCE
@@ -714,34 +864,18 @@ async def websocket_endpoint(
             silence_task = None
 
     async def wait_until_listening():
-        """
-        Block until TTS playback mute ends.
+        """Block until the agent is done speaking and the mic is live."""
 
-        Sleep in short slices so a temporary mic_muted_until=inf
-        (set while a new clip is being prepared) does not hang
-        forever after the real end time is written.
-        """
+        while bot_is_speaking() or speech_active:
 
-        while True:
-
-            remaining = (
-                mic_muted_until
-                - time.monotonic()
-            )
-
-            if remaining <= 0:
-
-                return
-
-            await asyncio.sleep(
-                min(remaining, 0.25)
-            )
+            await asyncio.sleep(0.2)
 
     async def _finish(
         ended_early: bool,
     ):
 
         await stop_silence_timer()
+        await _cancel_playback_fallback()
 
         try:
 
@@ -778,26 +912,32 @@ async def websocket_endpoint(
 
         nonlocal silence_level
 
-        step = (
+        step = float(
             interview_manager.silence_step_seconds
         )
+        slice_s = 0.25
 
         while True:
 
-            # Count silence only while the mic is live (after playback).
             await wait_until_listening()
 
-            await asyncio.sleep(
-                step
-            )
+            # Accumulate real silence in slices so mid-wait agent
+            # speech resets the counter (no nudges during summary).
+            silent_for = 0.0
 
-            if speech_active:
+            while silent_for < step:
 
-                continue
+                await asyncio.sleep(slice_s)
 
-            # User may have spoken (and been muted-out) during the wait;
-            # or TTS may have started again — only nudge on true silence.
-            if time.monotonic() < mic_muted_until:
+                if speech_active or bot_is_speaking():
+
+                    silent_for = 0.0
+                    await wait_until_listening()
+                    continue
+
+                silent_for += slice_s
+
+            if speech_active or bot_is_speaking():
 
                 continue
 
@@ -921,9 +1061,28 @@ async def websocket_endpoint(
                 "text"
             ) is not None:
 
+                raw_text = message["text"]
+
+                try:
+
+                    data = json.loads(raw_text)
+
+                except Exception:
+
+                    data = None
+
+                if (
+                    isinstance(data, dict)
+                    and data.get("type") == "playback_done"
+                ):
+
+                    await mark_playback_done()
+
+                    continue
+
                 await websocket.send_json({
                     "type": "message_received",
-                    "message": message["text"],
+                    "message": raw_text,
                 })
 
                 continue
@@ -940,9 +1099,9 @@ async def websocket_endpoint(
 
                 continue
 
-            now = time.monotonic()
-
-            if now < mic_muted_until:
+            # Gate mic while the agent turn is still playing —
+            # including the whole multi-clip summary until ack.
+            if bot_is_speaking():
 
                 continue
 
@@ -1247,6 +1406,7 @@ async def websocket_endpoint(
     finally:
 
         await stop_silence_timer()
+        await _cancel_playback_fallback()
 
         for task in value_tasks.values():
 
