@@ -1,44 +1,35 @@
-import json
-
 from langchain_groq import ChatGroq
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_core.tools import StructuredTool
-from pydantic import BaseModel, Field, create_model
+from pydantic import Field, create_model
 
 from Backend import config
-from Backend.agent.state import AgentState
+from Backend.agent.interview_manager import NONE_VALUE
 
 
 # ============================================================
 # LLM
 # ============================================================
+# temperature=0: this is extraction/classification, not writing.
+# Any randomness here shows up as flaky tool-call behaviour on
+# borderline answers.
 
 llm = ChatGroq(
     api_key=config.GROQ_API_KEY,
     model="openai/gpt-oss-20b",
-    temperature=0.3,
+    temperature=0,
 )
 
 
 # ============================================================
-# Known STT artifacts / obviously invalid answers
+# Known STT artifacts / obviously empty answers
 # ============================================================
+# Only treat true empties and known STT garbage as invalid here.
+# Short conversational words (تمام، نعم، اه، لا، مش عارف) can be
+# real answers or summary confirmations — let the LLM decide.
 
 INVALID_TRANSCRIPTS = {
     "",
-    "لا",
-    "لأ",
-    "مش عارف",
-    "مش عارفة",
-    "معرفش",
-    "ماعرفش",
-    "ونكمل",
-    "منور",
-    "تمام",
-    "نعم",
-    "اه",
-    "آه",
-    "أيوه",
     "@@فراغ",
     "فراغ",
 }
@@ -46,669 +37,278 @@ INVALID_TRANSCRIPTS = {
 
 def is_obviously_invalid(transcript: str) -> bool:
 
-    normalized = (
-        transcript
-        .strip()
-        .lower()
-    )
+    normalized = transcript.strip().lower()
 
     return normalized in INVALID_TRANSCRIPTS
 
 
 # ============================================================
-# Dynamic tool creation — accept the current question's answer
+# Field update tool
 # ============================================================
 
-def create_update_tool(
-    target_fields: list[str],
-):
-    """
-    Create a tool that can ONLY update fields belonging
-    to the current interview question.
+def _build_update_tool(fields: list[dict]) -> StructuredTool:
 
-    Fields that represent multiple values use list[str].
-    Single-value fields use str.
-    """
+    model_fields = {}
 
-    fields = {}
+    for field in fields:
 
-    # Fields that can contain multiple extracted values.
-    LIST_FIELDS = {
-        "key_skills",
-        "tools_technologies",
-    }
+        annotation = (
+            list[str] | None if field.get("multi") else str | None
+        )
 
-    for field in target_fields:
-
-        if field in LIST_FIELDS:
-
-            fields[field] = (
-                list[str] | None,
-                Field(
-                    default=None,
-                    description=(
-                        f"List of values extracted for {field}. "
-                        "Only provide this if the candidate "
-                        "actually answered the current question. "
-                        "Each item should be a separate skill, "
-                        "tool, technology, or programming language."
-                    ),
+        model_fields[field["name"]] = (
+            annotation,
+            Field(
+                default=None,
+                description=(
+                    f"{field['description']} Set to the exact "
+                    "string \"NONE\" (or [\"NONE\"] for a list "
+                    "field) if the candidate explicitly said they "
+                    "don't have this — that is different from not "
+                    "mentioning it at all."
                 ),
-            )
+            ),
+        )
 
-        else:
-
-            fields[field] = (
-                str | None,
-                Field(
-                    default=None,
-                    description=(
-                        f"Value extracted for {field}. "
-                        "Only provide this if the candidate "
-                        "actually answered the current question."
-                    ),
-                ),
-            )
-
-    UpdateModel = create_model(
-        "CandidateUpdate",
-        **fields,
-    )
+    UpdateModel = create_model("AnswerUpdate", **model_fields)
 
     def update_candidate_info(**kwargs):
-
-        updates = {}
-
-        for field, value in kwargs.items():
-
-            if value is None:
-                continue
-
-            # Single-value fields
-            if isinstance(value, str):
-
-                value = value.strip()
-
-                if not value:
-                    continue
-
-            # Multi-value fields
-            elif isinstance(value, list):
-
-                cleaned_values = []
-
-                for item in value:
-
-                    if item is None:
-                        continue
-
-                    item = str(item).strip()
-
-                    if item:
-                        cleaned_values.append(item)
-
-                if not cleaned_values:
-                    continue
-
-                value = cleaned_values
-
-            updates[field] = value
-
-        return updates
+        return kwargs
 
     return StructuredTool.from_function(
         func=update_candidate_info,
         name="update_candidate_info",
         description=(
-            "Update candidate information ONLY when the "
-            "candidate has actually answered the current "
-            "interview question. "
-            "DO NOT call this tool for greetings, yes/no "
-            "acknowledgements, refusals, unrelated answers, "
-            "questions, or unclear speech."
+            "Call this ONLY when the candidate actually answered "
+            "the CURRENT QUESTION with real information (or "
+            "explicitly said they don't have it). Never call this "
+            "for greetings, meta-conversation, or an answer to a "
+            "different question."
         ),
         args_schema=UpdateModel,
     )
 
 
-# ============================================================
-# Extraction prompt
-# ============================================================
+def _build_intent_tool(intents: list[dict]) -> StructuredTool | None:
 
-EXTRACTION_PROMPT = """
-You are a STRICT answer validation and information
-extraction system for an Egyptian Arabic recruitment interview.
+    if not intents:
+        return None
 
-Your job is simple:
+    from typing import Literal
 
-1. Look at the CURRENT QUESTION.
-2. Look at the CANDIDATE ANSWER.
-3. Decide whether the candidate actually answered
-   the current question.
-4. If they answered it, call update_candidate_info.
-5. If they did NOT answer it, DO NOT call the tool.
+    ids = tuple(i["id"] for i in intents)
 
-==================================================
-VERY IMPORTANT
-==================================================
+    IntentModel = create_model(
+        "IntentMatch",
+        intent_id=(
+            Literal[ids],
+            Field(..., description="Which situation this is."),
+        ),
+    )
 
-A tool call means:
+    def match_intent(intent_id: str):
+        return {"intent_id": intent_id}
 
-"THE CANDIDATE ANSWERED THE CURRENT QUESTION."
+    return StructuredTool.from_function(
+        func=match_intent,
+        name="match_intent",
+        description=(
+            "Call this when the candidate said something that is "
+            "NOT an answer to the current question, but matches "
+            "one of the known situations below (e.g. they can't "
+            "hear, ask you to repeat, ask who's calling, ask to be "
+            "called later). Do not call this for a normal answer."
+        ),
+        args_schema=IntentModel,
+    )
 
-Therefore NEVER call the tool just because the candidate
-said something understandable.
 
-The answer MUST contain information relevant to the
-CURRENT QUESTION.
+def _describe_fields(fields: list[dict]) -> str:
 
-==================================================
-INVALID ANSWERS
-==================================================
+    return "\n".join(
+        f"- {f['name']} ({'list of strings' if f.get('multi') else 'string'}): {f['description']}"
+        for f in fields
+    )
 
-Do NOT call the tool for:
 
-"لا"
-"لأ"
-"مش عارف"
-"مش عارفة"
-"معرفش"
-"ماعرفش"
-"نعم"
-"آه"
-"أيوه"
-"تمام"
-"منور"
-"ونكمل"
-"فراغ"
-"@@فراغ"
+def _describe_intents(intents: list[dict]) -> str:
 
-Also do NOT call the tool for:
+    lines = []
 
-- greetings
-- acknowledgements
-- confirmations
-- questions
-- unrelated statements
-- unclear speech
-- meaningless speech
-- an answer to another interview question
+    for intent in intents:
 
-==================================================
-EXAMPLES
-==================================================
+        examples = " | ".join(intent.get("examples", []))
 
-CURRENT QUESTION:
-ممكن أعرف اسم حضرتك بالكامل؟
+        lines.append(
+            f"- {intent['id']}: {intent['description']}\n"
+            f"  examples: {examples}"
+        )
 
-CANDIDATE:
-إي نعم
+    return "\n".join(lines)
 
-RESULT:
-DO NOT CALL THE TOOL.
 
---------------------------------------------------
+TURN_PROMPT = """
+You are handling one turn of an Egyptian Arabic recruitment phone
+interview.
 
-CURRENT QUESTION:
-ممكن أعرف اسم حضرتك بالكامل؟
-
-CANDIDATE:
-أنا طاهر محمد
-
-RESULT:
-CALL update_candidate_info with:
-
-candidate_name = "طاهر محمد"
-
---------------------------------------------------
-
-CURRENT QUESTION:
-إيه المجال أو الشغلانة اللي بتدور عليها؟
-
-CANDIDATE:
-@@فراغ
-
-RESULT:
-DO NOT CALL THE TOOL.
-
---------------------------------------------------
-
-CURRENT QUESTION:
-إيه المجال أو الشغلانة اللي بتدور عليها؟
-
-CANDIDATE:
-أنا بدور على شغل في مجال الذكاء الاصطناعي
-
-RESULT:
-CALL update_candidate_info with:
-
-target_domain = "الذكاء الاصطناعي"
-
---------------------------------------------------
-
-CURRENT QUESTION:
-عندك كام سنة خبرة في المجال ده؟
-
-CANDIDATE:
-ونكمل
-
-RESULT:
-DO NOT CALL THE TOOL.
-
---------------------------------------------------
-
-CURRENT QUESTION:
-عندك كام سنة خبرة في المجال ده؟
-
-CANDIDATE:
-عندي 3 سنين خبرة
-
-RESULT:
-CALL update_candidate_info with:
-
-years_of_experience = "3"
-
---------------------------------------------------
-
-CURRENT QUESTION:
-عندك كام سنة خبرة في المجال ده؟
-
-CANDIDATE:
-لسه متخرج وممعنديش خبرة
-
-RESULT:
-CALL update_candidate_info with:
-
-years_of_experience = "0"
-
-ZERO EXPERIENCE IS A VALID ANSWER.
-
---------------------------------------------------
-
-CURRENT QUESTION:
-إيه مؤهلك الدراسي أو أعلى شهادة معاك؟
-
-CANDIDATE:
-إنه مش فاهم معي
-
-RESULT:
-DO NOT CALL THE TOOL.
-
---------------------------------------------------
-
-CURRENT QUESTION:
-إيه مؤهلك الدراسي أو أعلى شهادة معاك؟
-
-CANDIDATE:
-أنا بدرس علوم حاسب
-
-RESULT:
-CALL update_candidate_info with:
-
-education_level = "علوم حاسب"
-
---------------------------------------------------
-
-CURRENT QUESTION:
-إيه أهم المهارات والبرامج أو الأدوات اللي بتستخدمها باستمرار؟
-
-CANDIDATE:
-نعم
-
-RESULT:
-DO NOT CALL THE TOOL.
-
---------------------------------------------------
-
-CURRENT QUESTION:
-إيه أهم المهارات والبرامج أو الأدوات اللي بتستخدمها باستمرار؟
-
-CANDIDATE:
-Python و SQL وبستخدم Git و Docker
-
-RESULT:
-CALL update_candidate_info with:
-
-key_skills = ["Python", "SQL"]
-tools_technologies = ["Git", "Docker"]
-
-==================================================
-CRITICAL RULE
-==================================================
-
-Do not extract information from an answer unless the answer
-actually answers the CURRENT QUESTION.
-
-For example:
-
-Question:
-ممكن أعرف اسم حضرتك بالكامل؟
-
-Answer:
-عندي 3 سنين خبرة.
-
-DO NOT call the tool.
-
-Even though "3 سنين خبرة" is useful candidate information,
-it answers a different question.
-
-==================================================
-CURRENT QUESTION
-==================================================
+CURRENT QUESTION (what was just asked):
 
 {question}
 
-==================================================
-ALLOWED FIELDS
-==================================================
+Decide exactly ONE of three things:
 
-{target_fields}
+1. The candidate ANSWERED the current question (or explicitly said
+   they don't have the thing being asked about)
+   -> call update_candidate_info
 
-==================================================
-CANDIDATE ANSWER
-==================================================
+2. The candidate said something else entirely — they can't hear,
+   ask you to repeat, ask who's calling, ask to be called later,
+   etc. — matching one of the situations below
+   -> call match_intent
+
+3. Neither of the above clearly applies
+   -> call NOTHING
+
+Never call both tools. Never guess a field value you are not
+confident about.
+
+FIELDS THIS QUESTION CAN FILL:
+
+{fields}
+
+KNOWN SITUATIONS (for match_intent):
+
+{intents}
+
+RULES:
+
+- "لسه متخرج" or "ممعنديش خبرة" for years_of_experience means "0".
+  Zero experience is a real answer, not a missing one.
+- For list fields, put each skill/tool as its own separate item.
+- The speech comes from an imperfect speech-to-text system; extract
+  what is clearly there and ignore obvious noise.
+- Only match an intent if the candidate's words clearly fit one of
+  the situations above — a real (even partial) answer to the
+  question always takes priority over an intent match.
+
+CANDIDATE SAID:
 
 {transcript}
 """
 
 
-# ============================================================
-# Extraction
-# ============================================================
+async def process_turn(
+    question_text: str,
+    fields: list[dict],
+    intents: list[dict],
+    transcript: str,
+) -> dict:
+    """
+    One LLM call that decides between three outcomes, so a normal
+    turn never costs more than a single round trip:
 
-async def extract_candidate_info(
-    state: AgentState,
-) -> AgentState:
+        {"kind": "answer", "updates": {...}}
+        {"kind": "intent", "intent_id": "..."}
+        {"kind": "none"}
+    """
 
-    question = state.get("current_question")
+    update_tool = _build_update_tool(fields)
+    intent_tool = _build_intent_tool(intents)
 
-    if not question:
+    tools = [update_tool] + ([intent_tool] if intent_tool else [])
 
-        print(
-            "[EXTRACTION] No current question."
-        )
-
-        return {
-            **state,
-            "extraction_success": False,
-            "failure_reason": "no_speech",
-        }
-
-    transcript = (
-        state.get("transcript", "")
-        .strip()
-    )
-
-    # --------------------------------------------------------
-    # Empty / obvious STT artifact — skip the LLM call entirely,
-    # we already know this is the "unclear" case.
-    # --------------------------------------------------------
-
-    if is_obviously_invalid(transcript):
-
-        print(
-            "[EXTRACTION] "
-            f"Rejected obvious invalid transcript: "
-            f"{transcript!r}"
-        )
-
-        return {
-            **state,
-            "extraction_success": False,
-            "failure_reason": "no_speech",
-        }
-
-    # --------------------------------------------------------
-    # Determine allowed fields
-    # --------------------------------------------------------
-
-    if "target_field" in question:
-
-        target_fields = [
-            question["target_field"]
-        ]
-
-    elif "target_fields" in question:
-
-        target_fields = question["target_fields"]
-
-    else:
-
-        print(
-            "[EXTRACTION] "
-            "Question has no target fields."
-        )
-
-        return {
-            **state,
-            "extraction_success": False,
-            "failure_reason": "no_speech",
-        }
-
-    print(
-        "[EXTRACTION] Question:",
-        question["id"],
-    )
-
-    print(
-        "[EXTRACTION] Transcript:",
-        transcript,
-    )
-
-    print(
-        "[EXTRACTION] Allowed fields:",
-        target_fields,
-    )
-
-    # --------------------------------------------------------
-    # Create question-specific tool, bound alongside the static
-    # reject_answer tool so the LLM must always pick one or the
-    # other — never call nothing.
-    # --------------------------------------------------------
-
-    update_tool = create_update_tool(
-        target_fields
-    )
-
-    extraction_llm = llm.bind_tools(
-        [update_tool]
-    )
-
-    # --------------------------------------------------------
-    # Build prompt
-    # --------------------------------------------------------
-
-    prompt = EXTRACTION_PROMPT.format(
-        question=question["question_ar"],
-        target_fields=", ".join(target_fields),
+    prompt = TURN_PROMPT.format(
+        question=question_text,
+        fields=_describe_fields(fields),
+        intents=_describe_intents(intents),
         transcript=transcript,
     )
 
-    messages = [
-        SystemMessage(
-            content=prompt
-        ),
-        HumanMessage(
-            content=transcript
-        ),
-    ]
-
-    # --------------------------------------------------------
-    # Invoke LLM
-    # --------------------------------------------------------
-
-    response = await extraction_llm.ainvoke(
-        messages
+    response = await llm.bind_tools(tools).ainvoke(
+        [
+            SystemMessage(content=prompt),
+            HumanMessage(content=transcript),
+        ]
     )
 
-    print(
-        "[EXTRACTION] Raw response:",
-        response.content,
-    )
-
-    print(
-        "[EXTRACTION] Tool calls:",
-        response.tool_calls,
-    )
-
-    # --------------------------------------------------------
-    # No tool call = the model didn't extract anything for this
-    # question. Since is_obviously_invalid() already caught genuine
-    # empty/filler/silence transcripts earlier and returned before
-    # we ever got here, whatever reached this point had real,
-    # transcribed speech in it — so by elimination this means "said
-    # something, just not an answer to this question", not
-    # "didn't hear anything".
-    # --------------------------------------------------------
+    print("[EXTRACTION] Tool calls:", response.tool_calls)
 
     if not response.tool_calls:
-
-        print(
-            "[EXTRACTION] "
-            "No tool call -> answer rejected."
-        )
-
-        return {
-            **state,
-            "extraction_success": False,
-            "failure_reason": "wrong_answer",
-        }
-
-    # --------------------------------------------------------
-    # Process update_candidate_info call
-    # --------------------------------------------------------
-
-    candidate = {
-        **state["candidate"]
-    }
-
-    extracted_any = False
+        return {"kind": "none"}
 
     for tool_call in response.tool_calls:
 
-        if (
-            tool_call["name"]
-            != "update_candidate_info"
-        ):
+        if tool_call["name"] == "match_intent":
+
+            intent_id = tool_call.get("args", {}).get("intent_id")
+
+            if intent_id:
+                return {"kind": "intent", "intent_id": intent_id}
+
+        if tool_call["name"] == "update_candidate_info":
+
+            updates = _clean_updates(
+                tool_call.get("args", {}), fields
+            )
+
+            if updates:
+                return {"kind": "answer", "updates": updates}
+
+    return {"kind": "none"}
+
+
+def _clean_updates(args: dict, fields: list[dict]) -> dict:
+
+    allowed = {f["name"] for f in fields}
+
+    updates = {}
+
+    for name, value in args.items():
+
+        if name not in allowed or value is None:
             continue
 
-        args = tool_call.get(
-            "args",
-            {}
-        )
+        if isinstance(value, str):
 
-        print(
-            "[EXTRACTION] Tool arguments:",
-            args,
-        )
+            value = value.strip()
 
-        for field in target_fields:
-
-            value = args.get(field)
-
-            if value is None:
+            if not value:
                 continue
 
-            if isinstance(value, str):
+            if value.upper() == "NONE":
+                value = NONE_VALUE
 
-                value = value.strip()
+        elif isinstance(value, list):
+
+            cleaned = [
+                str(item).strip()
+                for item in value
+                if item is not None and str(item).strip()
+            ]
+
+            if not cleaned:
+                continue
+
+            if len(cleaned) == 1 and cleaned[0].upper() == "NONE":
+                value = NONE_VALUE
+            else:
+                value = [
+                    item for item in cleaned if item.upper() != "NONE"
+                ]
 
                 if not value:
                     continue
 
-            candidate[field] = value
+        updates[name] = value
 
-            extracted_any = True
-
-    # --------------------------------------------------------
-    # Tool call without useful data
-    # --------------------------------------------------------
-
-    if not extracted_any:
-
-        print(
-            "[EXTRACTION] "
-            "Tool was called but no useful "
-            "information was provided."
-        )
-
-        return {
-            **state,
-            "extraction_success": False,
-            "failure_reason": "wrong_answer",
-        }
-
-    # --------------------------------------------------------
-    # Success
-    # --------------------------------------------------------
-
-    print(
-        "[EXTRACTION] "
-        "Answer accepted."
-    )
-
-    print(
-        "[EXTRACTION] Updated candidate:",
-        candidate,
-    )
-
-    return {
-        **state,
-        "candidate": candidate,
-        "extraction_success": True,
-        "failure_reason": None,
-    }
+    return updates
 
 
 # ============================================================
-# Retry / clarification lines
+# Summary segments
 # ============================================================
-# Spoken before repeating a question after a rejected answer. The
-# actual Arabic prefix text lives in questions.json (as the
-# "no_speech_retry" / "wrong_answer_retry" system_message entries)
-# rather than here — this just joins whatever prefix graph.py looks
-# up with that question's own question_ar.
 
-def build_retry_text(
-    question_ar: str,
-    prefix: str,
-) -> str:
-
-    return f"{prefix}{question_ar}"
-
-
-# ============================================================
-# End-of-interview summary
-# ============================================================
-# Everything below supports the "review your answers" step: turning
-# the collected candidate dict into spoken Arabic text, and later
-# classifying whether the candidate's reply to that summary means
-# "confirm, we're done" or "change one specific field".
-
-FIELD_LABELS: dict[str, str] = {
-    "candidate_name": "الاسم",
-    "target_domain": "المجال أو الشغلانة",
-    "years_of_experience": "سنين الخبرة",
-    "education_level": "المؤهل الدراسي",
-    "key_skills": "المهارات",
-    "tools_technologies": "الأدوات والبرامج",
-    "english_proficiency": "مستوى الإنجليزي",
-}
-
-# Fixed, readable order for the spoken summary — independent of
-# whatever order fields happened to be extracted/updated in.
-_SUMMARY_FIELD_ORDER = [
-    "candidate_name",
-    "target_domain",
-    "years_of_experience",
-    "education_level",
-    "key_skills",
-    "tools_technologies",
-    "english_proficiency",
-]
-
-
-def _format_summary_value(value) -> str:
+def format_value(value) -> str:
 
     if isinstance(value, list):
         return "، ".join(str(item) for item in value)
@@ -716,89 +316,64 @@ def _format_summary_value(value) -> str:
     return str(value)
 
 
-def build_summary_text(candidate: dict) -> str:
+def build_summary_segments(
+    candidate: dict,
+    interview_manager,
+) -> list[dict]:
     """
-    Builds the Arabic text spoken back to the candidate at the end
-    of the interview, listing every field collected so far. Called
-    both the first time (after the last question) and again after
-    every correction, since the values change each time.
+    Assembles the full summary as a segment list: cached intro,
+    then for every field the candidate actually has a value for,
+    either its fully-cached "none" line or its cached label followed
+    by the one genuinely dynamic piece (the value itself), then the
+    cached confirm line.
+
+    A field never mentioned at all is skipped entirely, not read
+    back as empty.
     """
 
-    lines = []
+    segments = list(interview_manager.summary_config["intro"])
 
-    for field in _SUMMARY_FIELD_ORDER:
+    for label in interview_manager.summary_config["labels"]:
 
-        if field not in candidate:
+        field_name = label["field"]
+
+        value = candidate.get(field_name)
+
+        if value is None:
             continue
 
-        label = FIELD_LABELS.get(field, field)
+        if isinstance(value, (list, str)) and not value:
+            continue
 
-        lines.append(
-            f"{label}: {_format_summary_value(candidate[field])}"
+        if value == NONE_VALUE:
+
+            none_line = interview_manager.none_line_for_field(
+                field_name
+            )
+
+            if none_line:
+                segments.append(
+                    {"type": "static", **none_line}
+                )
+
+            continue
+
+        segments.append(
+            {"type": "static", "id": label["id"], "text": label["text"]}
         )
 
-    body = "، ".join(lines)
+        segments.append(
+            {"type": "value_text", "text": format_value(value)}
+        )
 
-    return (
-        "خليني أراجع مع حضرتك البيانات اللي سجلتها: "
-        f"{body}. "
-        "لو كله تمام قول تمام أو صح عشان نخلص المكالمة، "
-        "ولو حابب تعدل حاجة قول مثلاً غيرلي المؤهل أو غيرلي الخبرة."
-    )
+    segments.extend(interview_manager.summary_config["confirm"])
 
-
-# ------------------------------------------------------------
-# Summary reply classification tool
-# ------------------------------------------------------------
-
-class SummaryReplyArgs(BaseModel):
-
-    action: str = Field(
-        ...,
-        description=(
-            "'confirm' if the candidate is happy with the summary "
-            "and wants to finish the call. 'correct' if they want "
-            "to change one specific piece of information."
-        ),
-    )
-
-    field: str | None = Field(
-        default=None,
-        description=(
-            "Required when action is 'correct'. Must be exactly "
-            "one of: candidate_name, target_domain, "
-            "years_of_experience, education_level, key_skills, "
-            "tools_technologies, english_proficiency. "
-            "Omit when action is 'confirm'."
-        ),
-    )
+    return segments
 
 
-def _resolve_summary_reply(
-    action: str,
-    field: str | None = None,
-):
-    return {
-        "action": action,
-        "field": field,
-    }
-
-
-resolve_summary_reply_tool = StructuredTool.from_function(
-    func=_resolve_summary_reply,
-    name="resolve_summary_reply",
-    description=(
-        "Call this once you have decided whether the candidate "
-        "confirmed the summary as correct, or asked to change one "
-        "specific field in it."
-    ),
-    args_schema=SummaryReplyArgs,
-)
-
-summary_reply_llm = llm.bind_tools(
-    [resolve_summary_reply_tool]
-)
-
+# ============================================================
+# Summary reply classification
+# ============================================================
 
 SUMMARY_REPLY_PROMPT = """
 You are classifying an Egyptian Arabic candidate's reply to a
@@ -807,98 +382,76 @@ spoken summary of their interview answers.
 Decide exactly one of two things:
 
 1. The candidate CONFIRMED the summary is correct and wants to
-   finish the call.
-2. The candidate wants to CORRECT one specific field.
+   finish  -> action = "confirm"
+2. The candidate wants to CORRECT one specific field
+   -> action = "correct", field = <field name>
 
-Always call resolve_summary_reply with your decision.
+Always call resolve_summary_reply.
 
-==================================================
-VALID FIELDS FOR CORRECTION
-==================================================
+FIELDS THAT CAN BE CORRECTED:
 
-candidate_name          — الاسم
-target_domain           — المجال أو الشغلانة
-years_of_experience     — سنين الخبرة
-education_level         — المؤهل الدراسي
-key_skills              — المهارات
-tools_technologies      — الأدوات والبرامج
-english_proficiency     — مستوى الإنجليزي
+{fields}
 
-==================================================
-EXAMPLES
-==================================================
+EXAMPLES:
 
-CANDIDATE:
-تمام و صح و شكرا
+"تمام و صح و شكرا"        -> confirm
+"ايوة كده تمام خلاص"      -> confirm
+"غيرلي المؤهل"            -> correct, education_level
+"لأ عايز أعدل سنين الخبرة" -> correct, years_of_experience
+"اسمي غلط"                -> correct, candidate_name
 
-RESULT:
-action = "confirm"
-
---------------------------------------------------
-
-CANDIDATE:
-ايوة كده تمام خلاص
-
-RESULT:
-action = "confirm"
-
---------------------------------------------------
-
-CANDIDATE:
-غيرلي المؤهل
-
-RESULT:
-action = "correct"
-field = "education_level"
-
---------------------------------------------------
-
-CANDIDATE:
-لأ عايز أعدل سنين الخبرة
-
-RESULT:
-action = "correct"
-field = "years_of_experience"
-
---------------------------------------------------
-
-CANDIDATE:
-ممكن تغير الاسم، اسمي غلط
-
-RESULT:
-action = "correct"
-field = "candidate_name"
-
---------------------------------------------------
-
-CANDIDATE:
-غيرلي المهارات والأدوات
-
-RESULT:
-action = "correct"
-field = "key_skills"
-
-==================================================
-CANDIDATE REPLY
-==================================================
+CANDIDATE REPLY:
 
 {transcript}
 """
 
 
+def _build_summary_reply_tool(fields: list[dict]) -> StructuredTool:
+
+    from typing import Literal
+
+    names = tuple(f["name"] for f in fields)
+
+    Model = create_model(
+        "SummaryReply",
+        action=(
+            str,
+            Field(
+                ...,
+                description=(
+                    "'confirm' to finish, or 'correct' to change "
+                    "one field."
+                ),
+            ),
+        ),
+        field=(
+            Literal[names] | None,
+            Field(
+                default=None,
+                description="Required when action is 'correct'.",
+            ),
+        ),
+    )
+
+    def resolve_summary_reply(action: str, field: str | None = None):
+        return {"action": action, "field": field}
+
+    return StructuredTool.from_function(
+        func=resolve_summary_reply,
+        name="resolve_summary_reply",
+        description="Record the candidate's reply to the summary.",
+        args_schema=Model,
+    )
+
+
 async def classify_summary_reply(
     transcript: str,
+    fields: list[dict],
 ) -> dict:
     """
-    Returns one of:
-        {"action": "confirm", "field": None}
-        {"action": "correct", "field": <one of FIELD_LABELS>}
-        {"action": "unclear", "field": None}
-
-    "unclear" covers both a genuinely ambiguous reply and a
-    'correct' request naming a field we don't recognize — in both
-    cases the caller should just replay the summary rather than
-    guess.
+    Returns {"action": "confirm"}, {"action": "correct", "field":
+    ...}, or {"action": "unclear"} — the caller replays the summary
+    on "unclear" rather than guessing.
     """
 
     transcript = transcript.strip()
@@ -906,28 +459,26 @@ async def classify_summary_reply(
     if not transcript:
         return {"action": "unclear", "field": None}
 
-    prompt = SUMMARY_REPLY_PROMPT.format(
-        transcript=transcript,
+    correctable = [f for f in fields if f.get("asked_by")]
+
+    described = "\n".join(
+        f"- {f['name']} — {f['label']}" for f in correctable
     )
 
-    messages = [
-        SystemMessage(content=prompt),
-        HumanMessage(content=transcript),
-    ]
+    tool = _build_summary_reply_tool(correctable)
 
-    response = await summary_reply_llm.ainvoke(
-        messages
+    response = await llm.bind_tools([tool]).ainvoke(
+        [
+            SystemMessage(
+                content=SUMMARY_REPLY_PROMPT.format(
+                    fields=described, transcript=transcript
+                )
+            ),
+            HumanMessage(content=transcript),
+        ]
     )
 
-    print(
-        "[SUMMARY] Raw response:",
-        response.content,
-    )
-
-    print(
-        "[SUMMARY] Tool calls:",
-        response.tool_calls,
-    )
+    print("[SUMMARY] Tool calls:", response.tool_calls)
 
     if not response.tool_calls:
         return {"action": "unclear", "field": None}
@@ -940,13 +491,7 @@ async def classify_summary_reply(
     if action == "confirm":
         return {"action": "confirm", "field": None}
 
-    if action == "correct" and field in FIELD_LABELS:
+    if action == "correct" and field:
         return {"action": "correct", "field": field}
-
-    print(
-        "[SUMMARY] Unrecognized action/field:",
-        action,
-        field,
-    )
 
     return {"action": "unclear", "field": None}

@@ -1,11 +1,12 @@
 from langgraph.graph import StateGraph, START, END
 
 from Backend.agent.state import AgentState
-from Backend.agent.interview_manager import InterviewManager
+from Backend.agent.interview_manager import InterviewManager, NONE_VALUE
 from Backend.agent.extraction import (
-    extract_candidate_info,
-    build_summary_text,
+    build_summary_segments,
     classify_summary_reply,
+    is_obviously_invalid,
+    process_turn,
 )
 
 
@@ -15,613 +16,491 @@ interview_manager = InterviewManager(QUESTIONS_PATH)
 
 
 # ============================================================
-# Initialize interview
+# Segment resolution
+# ============================================================
+# Turns a question's raw segment list (which may contain "value"
+# segments referencing a field) into what handler.py actually
+# speaks — plain {"kind": "static"/"value", ...} dicts with every
+# value already substituted from the candidate dict. Keeping this
+# resolution in the graph means handler.py never touches
+# state["candidate"] directly.
+
+def _resolve_segments(
+    segments: list[dict],
+    candidate: dict,
+) -> list[dict]:
+
+    resolved = []
+
+    for seg in segments:
+
+        if seg["type"] == "static":
+
+            resolved.append(
+                {"kind": "static", "id": seg["id"], "text": seg["text"]}
+            )
+
+        elif seg["type"] == "value":
+
+            value = candidate.get(seg["field"])
+
+            if value is None or value == NONE_VALUE:
+                continue
+
+            resolved.append(
+                {"kind": "value", "text": _format(value)}
+            )
+
+        elif seg["type"] == "value_text":
+
+            # Already-formatted text (used by build_summary_segments,
+            # which resolves the value itself before this point).
+            resolved.append({"kind": "value", "text": seg["text"]})
+
+    return resolved
+
+
+def _format(value) -> str:
+
+    if isinstance(value, list):
+        return "، ".join(str(item) for item in value)
+
+    return str(value)
+
+
+def _plain_text(segments: list[dict], candidate: dict) -> str:
+    """
+    The full sentence actually spoken for these segments, used as
+    the CURRENT QUESTION context in the extraction prompt. Built by
+    resolving and joining every segment (not just assuming the last
+    one is static) so this stays correct regardless of where a
+    "value" segment falls in the sentence.
+    """
+
+    resolved = _resolve_segments(segments, candidate)
+
+    return " ".join(seg["text"] for seg in resolved)
+
+
+def _question_prompt(
+    question: dict,
+    candidate: dict,
+    repeat: bool = False,
+) -> list[dict]:
+
+    segments = (
+        question.get("repeat_segments") or question["segments"]
+        if repeat
+        else question["segments"]
+    )
+
+    return _resolve_segments(segments, candidate)
+
+
+# ============================================================
+# Start
 # ============================================================
 
-async def initialize_interview(
-    state: AgentState,
-) -> AgentState:
+async def start_interview(state: AgentState) -> AgentState:
 
-    welcome = interview_manager.get_question(0)
+    print("[GRAPH] Starting interview")
 
-    print(
-        "[GRAPH] Initializing interview"
-    )
-
-    print(
-        "[GRAPH] Welcome question:",
-        welcome["id"] if welcome else None,
-    )
+    first_question = interview_manager.get_question(0)
 
     return {
         **state,
-        "questions": interview_manager.questions,
+        "candidate": {},
         "current_question_index": 0,
-        "current_question": welcome,
-        "response": (
-            welcome["question_ar"]
-            if welcome
-            else ""
-        ),
-        "interview_finished": False,
-        "extraction_success": False,
-        "transcript": "",
+        "current_question": first_question,
         "mode": "interview",
+        "current_prompt": _question_prompt(first_question, {}),
+        "intent_prompt": [],
+        "retry_count": 0,
+        "extraction_success": True,
         "failure_reason": None,
+        "interview_finished": False,
+        "ended_early": False,
+        "transcript": "",
     }
 
 
 # ============================================================
-# Extraction
+# Advance / summary helpers
 # ============================================================
 
-async def extract_answer(
-    state: AgentState,
-) -> AgentState:
+def _advance_or_summarize(state: AgentState) -> AgentState:
 
-    print(
-        "[GRAPH] Extracting answer for:",
-        (
-            state["current_question"]["id"]
-            if state.get("current_question")
-            else None
-        ),
+    candidate = state["candidate"]
+
+    next_index = state["current_question_index"] + 1
+
+    next_question = interview_manager.get_question(next_index)
+
+    if next_question is None:
+
+        print("[GRAPH] Out of questions -> summary")
+
+        return _build_summary(state)
+
+    print("[GRAPH] Advancing to:", next_question["id"])
+
+    return {
+        **state,
+        "current_question_index": next_index,
+        "current_question": next_question,
+        "mode": "interview",
+        "current_prompt": _question_prompt(next_question, candidate),
+        "intent_prompt": [],
+        "retry_count": 0,
+        "extraction_success": True,
+        "failure_reason": None,
+        "transcript": "",
+    }
+
+
+def _build_summary(state: AgentState) -> AgentState:
+
+    segments = build_summary_segments(
+        state["candidate"], interview_manager
     )
 
-    return await extract_candidate_info(state)
+    return {
+        **state,
+        "current_question": None,
+        "mode": "summary",
+        "current_prompt": _resolve_segments(segments, state["candidate"]),
+        "intent_prompt": [],
+        "retry_count": 0,
+        "extraction_success": True,
+        "failure_reason": None,
+        "transcript": "",
+    }
+
+
+def _retry_or_skip(state: AgentState, failure_reason: str) -> AgentState:
+    """
+    Repeats the current question, unless it has already failed
+    max_retries_per_question times in a row — then it moves on
+    rather than looping forever. Required fields still get skipped
+    past this limit (better an incomplete interview than a stuck
+    call); skip_optional_after_max_retries only changes whether an
+    optional field's absence is worth distinguishing in logs, since
+    either way we must advance.
+    """
+
+    question = state["current_question"]
+    candidate = state["candidate"]
+
+    retry_count = state["retry_count"] + 1
+
+    if retry_count >= interview_manager.max_retries_per_question:
+
+        print(
+            "[GRAPH] Max retries reached for",
+            question["id"] if question else None,
+            "- skipping",
+        )
+
+        return _advance_or_summarize({**state, "retry_count": 0})
+
+    return {
+        **state,
+        "current_prompt": _question_prompt(
+            question, candidate, repeat=True
+        ),
+        "intent_prompt": [],
+        "retry_count": retry_count,
+        "extraction_success": False,
+        "failure_reason": failure_reason,
+        "transcript": "",
+    }
 
 
 # ============================================================
-# Question lookup helpers
+# Process an answer to a normal (or correcting) question
 # ============================================================
 
-SUMMARY_QUESTION_ID = "summary"
+async def process_answer(state: AgentState) -> AgentState:
 
-_RETRY_SUFFIXES = (
-    "__retry_no_speech",
-    "__retry_wrong_answer",
-)
+    question = state["current_question"]
+    transcript = state["transcript"].strip()
+    candidate = dict(state["candidate"])
+
+    # ----------------------------------------------------
+    # Obvious silence/filler — skip the LLM call entirely.
+    # ----------------------------------------------------
+
+    if is_obviously_invalid(transcript):
+
+        print("[GRAPH] Obviously invalid transcript")
+
+        return _retry_or_skip(state, "no_speech")
+
+    target_field_names = interview_manager.target_fields(question)
+
+    fields = [
+        interview_manager.get_field(name) for name in target_field_names
+    ]
+    fields = [f for f in fields if f is not None]
+
+    result = await process_turn(
+        question_text=_plain_text(question["segments"], candidate),
+        fields=fields,
+        intents=interview_manager.intents,
+        transcript=transcript,
+    )
+
+    print("[GRAPH] Turn result:", result)
+
+    # ----------------------------------------------------
+    # Intent matched — not an answer at all.
+    # ----------------------------------------------------
+
+    if result["kind"] == "intent":
+
+        return await _handle_intent(state, result["intent_id"])
+
+    # ----------------------------------------------------
+    # No usable answer, no intent match.
+    # ----------------------------------------------------
+
+    if result["kind"] != "answer" or not result["updates"]:
+
+        return _retry_or_skip(state, "wrong_answer")
+
+    # ----------------------------------------------------
+    # Real answer.
+    # ----------------------------------------------------
+
+    candidate.update(result["updates"])
+
+    new_state = {**state, "candidate": candidate}
+
+    if state["mode"] == "correcting":
+
+        print("[GRAPH] Correction applied, rebuilding summary")
+
+        return _build_summary(new_state)
+
+    return _advance_or_summarize(new_state)
 
 
-def _base_question_id(question_id: str) -> str:
-    """
-    A repeated question's id gets suffixed (see repeat_question
-    below) so speak() doesn't play stale cached audio for the wrong
-    text. This strips that suffix back off so the pristine original
-    question can always be found again, however many times in a row
-    it gets repeated — without this, a second consecutive failure
-    would re-prefix already-prefixed text instead of starting fresh.
-    """
+# ============================================================
+# Intents
+# ============================================================
 
-    for suffix in _RETRY_SUFFIXES:
+async def _handle_intent(state: AgentState, intent_id: str) -> AgentState:
 
-        if question_id.endswith(suffix):
-            return question_id[: -len(suffix)]
+    intent = interview_manager.get_intent(intent_id)
 
-    return question_id
+    if intent is None:
+        # Unknown id somehow — fall back to a normal retry rather
+        # than crash.
+        return _retry_or_skip(state, "wrong_answer")
 
+    intent_prompt = [
+        {"kind": "static", "id": intent["id"], "text": intent["text"]}
+    ]
 
-def _find_question_by_id(question_id: str) -> dict | None:
+    action = intent.get("then", "repeat_question")
 
-    for question in interview_manager.questions:
+    question = state["current_question"]
+    candidate = state["candidate"]
 
-        if question.get("id") == question_id:
-            return question
+    print("[GRAPH] Intent:", intent_id, "| then:", action)
 
-    return None
+    # --------------------------------------------------------
+    # wait: say the line, keep the exact same question active,
+    # don't touch retry_count (asking for a moment isn't a failed
+    # answer) and don't repeat the question — silence afterward is
+    # just them thinking.
+    # --------------------------------------------------------
 
+    if action == "wait":
 
-def _find_question_by_field(field: str | None) -> dict | None:
-    """
-    Maps a candidate field name (e.g. "education_level") back to the
-    interview question that collects it (e.g. q4_education), so a
-    correction request can jump straight there.
-    """
+        return {
+            **state,
+            "current_prompt": [],
+            "intent_prompt": intent_prompt,
+            "extraction_success": False,
+            "failure_reason": None,
+            "transcript": "",
+        }
 
-    if not field:
-        return None
+    # --------------------------------------------------------
+    # repeat_question: say the line, then repeat the question —
+    # doesn't count against the retry limit, this isn't a failed
+    # extraction attempt.
+    # --------------------------------------------------------
 
-    for question in interview_manager.questions:
+    if action == "repeat_question":
 
-        if question.get("target_field") == field:
-            return question
+        return {
+            **state,
+            "current_prompt": _question_prompt(
+                question, candidate, repeat=True
+            ),
+            "intent_prompt": intent_prompt,
+            "extraction_success": False,
+            "failure_reason": None,
+            "transcript": "",
+        }
 
-        if field in question.get("target_fields", []):
-            return question
+    # --------------------------------------------------------
+    # skip_question: say the line, move on without filling this
+    # question's fields.
+    # --------------------------------------------------------
 
-    return None
+    if action == "skip_question":
+
+        advanced = _advance_or_summarize({**state, "retry_count": 0})
+
+        return {**advanced, "intent_prompt": intent_prompt}
+
+    # --------------------------------------------------------
+    # end_call: say the line (it's already a full goodbye), stop
+    # here. handler.py sees ended_early and saves without playing
+    # the normal completion clip.
+    # --------------------------------------------------------
+
+    if action == "end_call":
+
+        return {
+            **state,
+            "current_prompt": [],
+            "intent_prompt": intent_prompt,
+            "mode": "finished",
+            "extraction_success": True,
+            "failure_reason": None,
+            "interview_finished": True,
+            "ended_early": True,
+            "transcript": "",
+        }
+
+    return _retry_or_skip(state, "wrong_answer")
 
 
 # ============================================================
 # Summary
 # ============================================================
 
-async def build_summary(
-    state: AgentState,
-) -> AgentState:
-    """
-    Builds the spoken end-of-interview summary from whatever's in
-    state["candidate"] right now. Reused both the first time (after
-    the last real question) and again after every correction, since
-    the values change each time.
+async def process_summary_reply(state: AgentState) -> AgentState:
 
-    Deliberately returns extraction_success=True: from handler.py's
-    point of view this is indistinguishable from "here is the next
-    question to ask" — it reuses that exact code path, so the
-    summary just gets spoken like any other question, with no
-    changes needed in handler.py.
-    """
+    transcript = state["transcript"].strip()
 
-    candidate = state.get("candidate", {})
+    if is_obviously_invalid(transcript):
 
-    summary_text = build_summary_text(candidate)
-
-    summary_question = {
-        "id": SUMMARY_QUESTION_ID,
-        "question_ar": summary_text,
-    }
-
-    print(
-        "[GRAPH] Built summary for confirmation"
-    )
-
-    return {
-        **state,
-        "current_question": summary_question,
-        "response": summary_text,
-        "mode": "summary",
-        "transcript": "",
-        "extraction_success": True,
-        "interview_finished": False,
-        "failure_reason": None,
-    }
-
-
-async def classify_summary(
-    state: AgentState,
-) -> AgentState:
-    """
-    Handles the candidate's reply to the summary: either they
-    confirmed it (=> finish), asked to change a specific field
-    (=> jump back to that question), or said something ambiguous
-    (=> replay the summary rather than guess).
-    """
-
-    transcript = state.get("transcript", "").strip()
-
-    decision = await classify_summary_reply(transcript)
-
-    print(
-        "[GRAPH] Summary reply decision:",
-        decision,
-    )
-
-    # --------------------------------------------------------
-    # Confirmed — finish the interview. This reuses the exact
-    # same (extraction_success=True, interview_finished=True)
-    # shape advance_question used to produce, so handler.py's
-    # existing "interview finished" branch handles it unchanged.
-    # --------------------------------------------------------
-
-    if decision["action"] == "confirm":
+        print("[GRAPH] Summary reply obviously invalid, replaying")
 
         return {
             **state,
-            "extraction_success": True,
-            "interview_finished": True,
-            "transcript": "",
+            "current_prompt": _resolve_segments(
+                build_summary_segments(
+                    state["candidate"], interview_manager
+                ),
+                state["candidate"],
+            ),
+            "intent_prompt": [],
+            "extraction_success": False,
             "failure_reason": None,
+            "transcript": "",
         }
 
-    # --------------------------------------------------------
-    # Correction requested — jump back to the matching question.
-    # --------------------------------------------------------
+    decision = await classify_summary_reply(
+        transcript, interview_manager.fields
+    )
+
+    print("[GRAPH] Summary reply:", decision)
+
+    if decision["action"] == "confirm":
+
+        candidate = state["candidate"]
+
+        return {
+            **state,
+            "mode": "finished",
+            "current_question": None,
+            "current_prompt": _resolve_segments(
+                interview_manager.completion_segments, candidate
+            ),
+            "intent_prompt": [],
+            "extraction_success": True,
+            "failure_reason": None,
+            "interview_finished": True,
+            "ended_early": False,
+            "transcript": "",
+        }
 
     if decision["action"] == "correct":
 
-        target_question = _find_question_by_field(
-            decision.get("field")
+        target_question = interview_manager.question_for_field(
+            decision["field"]
         )
 
         if target_question is not None:
 
-            print(
-                "[GRAPH] Jumping back to:",
-                target_question["id"],
-            )
+            print("[GRAPH] Correcting:", target_question["id"])
 
             return {
                 **state,
-                "current_question": target_question,
-                "response": target_question["question_ar"],
                 "mode": "correcting",
+                "current_question": target_question,
+                "current_prompt": _question_prompt(
+                    target_question, state["candidate"], repeat=True
+                ),
+                "intent_prompt": [],
+                "retry_count": 0,
                 "extraction_success": True,
-                "interview_finished": False,
-                "transcript": "",
                 "failure_reason": None,
+                "transcript": "",
             }
 
-    # --------------------------------------------------------
-    # Unclear reply, or a field we couldn't map to a question —
-    # replay the summary rather than guess what they meant. Mode
-    # stays "summary" (untouched via the state spread below) so
-    # repeat_question knows this isn't a normal question retry.
-    # --------------------------------------------------------
-
-    print(
-        "[GRAPH] Summary reply unclear, replaying summary"
-    )
+    print("[GRAPH] Summary reply unclear, replaying summary")
 
     return {
         **state,
+        "current_prompt": _resolve_segments(
+            build_summary_segments(
+                state["candidate"], interview_manager
+            ),
+            state["candidate"],
+        ),
+        "intent_prompt": [],
         "extraction_success": False,
-        "transcript": "",
         "failure_reason": None,
+        "transcript": "",
     }
 
 
 # ============================================================
-# START routing
+# Routing
 # ============================================================
 
-def route_from_start(
-    state: AgentState,
-):
-
-    current_question = state.get(
-        "current_question"
-    )
-
-    transcript = state.get(
-        "transcript",
-        "",
-    ).strip()
-
-    mode = state.get(
-        "mode",
-        "interview",
-    )
-
-    print(
-        "[GRAPH] START ROUTER"
-    )
-
-    print(
-        "[GRAPH] Current question:",
-        (
-            current_question["id"]
-            if current_question
-            else None
-        ),
-    )
-
-    print(
-        "[GRAPH] Transcript:",
-        transcript,
-    )
-
-    print(
-        "[GRAPH] Mode:",
-        mode,
-    )
-
-    # --------------------------------------------------------
-    # First invocation
-    # --------------------------------------------------------
-
-    if current_question is None:
-
-        print(
-            "[GRAPH] Route -> initialize"
-        )
-
-        return "initialize"
-
-    # --------------------------------------------------------
-    # We already have a question.
-    # Therefore this invocation is processing
-    # the candidate's answer.
-    # --------------------------------------------------------
-
-    if transcript:
-
-        if mode == "summary":
-
-            print(
-                "[GRAPH] Route -> classify_summary"
-            )
-
-            return "classify_summary"
-
-        print(
-            "[GRAPH] Route -> extract"
-        )
-
-        return "extract"
-
-    # --------------------------------------------------------
-    # No question and no transcript
-    # --------------------------------------------------------
-
-    print(
-        "[GRAPH] Route -> initialize"
-    )
-
-    return "initialize"
-
-
-# ============================================================
-# After extraction
-# ============================================================
-
-def route_after_extraction(
-    state: AgentState,
-):
-
-    success = state.get(
-        "extraction_success",
-        False,
-    )
-
-    mode = state.get(
-        "mode",
-        "interview",
-    )
-
-    print(
-        "[GRAPH] Extraction success:",
-        success,
-    )
-
-    if not success:
-
-        print(
-            "[GRAPH] Route -> repeat"
-        )
-
-        return "repeat"
-
-    # A successful answer while correcting a summary field goes
-    # back to the summary (rebuilt with the new value), not forward
-    # through the normal question sequence.
-    if mode == "correcting":
-
-        print(
-            "[GRAPH] Route -> summarize (post-correction)"
-        )
-
-        return "summarize"
-
-    print(
-        "[GRAPH] Route -> advance"
-    )
-
-    return "advance"
-
-
-# ============================================================
-# After advancing
-# ============================================================
-
-def route_after_advance(
-    state: AgentState,
-):
+def route_from_start(state: AgentState):
     """
-    advance_question sets current_question to None once it walks
-    past the last entry in questions.json. That's the signal to
-    build the summary instead of ending the graph normally.
+    current_question_index starts at -1 in handler.py's initial
+    state dict and is only ever set to >= 0 by start_interview.
+    That — NOT "is the transcript empty" — is what actually
+    distinguishes "this is the very first call" from "this is a
+    normal turn where STT happened to come back empty".
+
+    An empty transcript mid-interview must NOT re-trigger
+    start_interview: that would silently wipe state["candidate"]
+    and restart the whole call from question 0. process_answer's
+    and process_summary_reply's own is_obviously_invalid() checks
+    already treat "" correctly as a no_speech retry — there's
+    nothing left for this router to special-case.
     """
 
-    if state.get("current_question") is None:
+    if state.get("current_question_index", -1) < 0:
+        return "start"
 
-        print(
-            "[GRAPH] Route -> summarize (end of questions)"
-        )
+    mode = state.get("mode", "interview")
 
-        return "summarize"
+    if mode == "summary":
+        return "summary"
 
-    return "end"
-
-
-# ============================================================
-# After summary classification
-# ============================================================
-
-def route_after_summary_classification(
-    state: AgentState,
-):
-
-    if state.get("extraction_success"):
-        return "end"
-
-    print(
-        "[GRAPH] Route -> repeat (unclear summary reply)"
-    )
-
-    return "repeat"
-
-
-# ============================================================
-# Advance
-# ============================================================
-
-async def advance_question(
-    state: AgentState,
-) -> AgentState:
-
-    current_index = state[
-        "current_question_index"
-    ]
-
-    next_index = current_index + 1
-
-    next_question = (
-        interview_manager.get_question(
-            next_index
-        )
-    )
-
-    # questions.json now has two system_message entries appended
-    # after the real interview questions (the retry clarification
-    # lines). Walking into one of those by raw index means we've
-    # actually run out of real questions to ask — treat it exactly
-    # like next_question being None.
-    if (
-        next_question is not None
-        and next_question.get("type") == "system_message"
-    ):
-
-        print(
-            "[GRAPH] Reached system_message entry"
-            f" ({next_question['id']}) — treating as"
-            " end of real questions"
-        )
-
-        next_question = None
-
-    print(
-        "[GRAPH] Advancing from:",
-        (
-            state["current_question"]["id"]
-            if state.get("current_question")
-            else None
-        ),
-    )
-
-    print(
-        "[GRAPH] Next question:",
-        (
-            next_question["id"]
-            if next_question
-            else None
-        ),
-    )
-
-    # --------------------------------------------------------
-    # No more questions — routed to build_summary next, which
-    # will set current_question/response/mode appropriately.
-    # --------------------------------------------------------
-
-    if next_question is None:
-
-        return {
-            **state,
-            "current_question": None,
-            "current_question_index": next_index,
-            "transcript": "",
-        }
-
-    # --------------------------------------------------------
-    # Continue interview
-    #
-    # extraction_success is set True here (not left as whatever
-    # extract_answer produced) because advance_question is the last
-    # node executed before END on this path — its return values are
-    # what handler.py actually sees. Setting it False here (as an
-    # earlier version of this file did) would make handler.py treat
-    # every successful question transition as a failed answer.
-    # --------------------------------------------------------
-
-    return {
-        **state,
-        "current_question": next_question,
-        "current_question_index": next_index,
-        "response": next_question["question_ar"],
-        "transcript": "",
-        "extraction_success": True,
-        "failure_reason": None,
-        "mode": "interview",
-    }
-
-
-# ============================================================
-# Repeat
-# ============================================================
-
-async def repeat_question(
-    state: AgentState,
-) -> AgentState:
-
-    current_question = state.get(
-        "current_question"
-    )
-
-    mode = state.get(
-        "mode",
-        "interview",
-    )
-
-    # --------------------------------------------------------
-    # Unclear reply to the SUMMARY (not a real question) — just
-    # replay it as-is. No clarifying prefix here; that's specific
-    # to rejected answers on real interview questions.
-    # --------------------------------------------------------
-
-    if mode == "summary" or current_question is None:
-
-        print(
-            "[GRAPH] Repeating (as-is):",
-            (
-                current_question["id"]
-                if current_question
-                else None
-            ),
-        )
-
-        return {
-            **state,
-            "current_question": current_question,
-            "current_question_index": state[
-                "current_question_index"
-            ],
-            "response": (
-                current_question["question_ar"]
-                if current_question
-                else ""
-            ),
-            "transcript": "",
-            "extraction_success": False,
-        }
-
-    # --------------------------------------------------------
-    # Rejected answer to a real question — always resolve back to
-    # the PRISTINE question object (never trust current_question
-    # directly, in case it's already been repeated once and could
-    # in principle carry stale data). Deliberately does NOT build a
-    # combined "prefix + question" string here — that would force a
-    # fresh on-demand synthesis on every single repeat. Instead the
-    # question keeps its original id/text unchanged, so speak() in
-    # handler.py plays its already-cached audio directly. The
-    # clarifying prefix (no_speech_retry / wrong_answer_retry) is
-    # spoken separately by handler.py, from ITS OWN cached audio —
-    # so a repeat costs zero VoiceTut calls after the first
-    # pregeneration pass, ever.
-    # --------------------------------------------------------
-
-    base_id = _base_question_id(
-        current_question["id"]
-    )
-
-    base_question = (
-        _find_question_by_id(base_id)
-        or current_question
-    )
-
-    print(
-        "[GRAPH] Repeating (cached):",
-        base_question["id"],
-    )
-
-    return {
-        **state,
-        "current_question": base_question,
-        "current_question_index": state[
-            "current_question_index"
-        ],
-        "response": base_question["question_ar"],
-        "transcript": "",
-        "extraction_success": False,
-    }
+    return "answer"
 
 
 # ============================================================
@@ -630,113 +509,22 @@ async def repeat_question(
 
 builder = StateGraph(AgentState)
 
-
-builder.add_node(
-    "initialize_interview",
-    initialize_interview,
-)
-
-builder.add_node(
-    "extract_answer",
-    extract_answer,
-)
-
-builder.add_node(
-    "advance_question",
-    advance_question,
-)
-
-builder.add_node(
-    "repeat_question",
-    repeat_question,
-)
-
-builder.add_node(
-    "build_summary",
-    build_summary,
-)
-
-builder.add_node(
-    "classify_summary",
-    classify_summary,
-)
-
-
-# ============================================================
-# IMPORTANT:
-# START must be conditional
-# ============================================================
+builder.add_node("start_interview", start_interview)
+builder.add_node("process_answer", process_answer)
+builder.add_node("process_summary_reply", process_summary_reply)
 
 builder.add_conditional_edges(
     START,
     route_from_start,
     {
-        "initialize": "initialize_interview",
-        "extract": "extract_answer",
-        "classify_summary": "classify_summary",
+        "start": "start_interview",
+        "answer": "process_answer",
+        "summary": "process_summary_reply",
     },
 )
 
-
-# Initialization ends after setting welcome
-builder.add_edge(
-    "initialize_interview",
-    END,
-)
-
-
-# ============================================================
-# Extraction routing
-# ============================================================
-
-builder.add_conditional_edges(
-    "extract_answer",
-    route_after_extraction,
-    {
-        "advance": "advance_question",
-        "repeat": "repeat_question",
-        "summarize": "build_summary",
-    },
-)
-
-
-# ============================================================
-# Advance routing
-# ============================================================
-
-builder.add_conditional_edges(
-    "advance_question",
-    route_after_advance,
-    {
-        "summarize": "build_summary",
-        "end": END,
-    },
-)
-
-
-builder.add_edge(
-    "repeat_question",
-    END,
-)
-
-builder.add_edge(
-    "build_summary",
-    END,
-)
-
-
-# ============================================================
-# Summary classification routing
-# ============================================================
-
-builder.add_conditional_edges(
-    "classify_summary",
-    route_after_summary_classification,
-    {
-        "repeat": "repeat_question",
-        "end": END,
-    },
-)
-
+builder.add_edge("start_interview", END)
+builder.add_edge("process_answer", END)
+builder.add_edge("process_summary_reply", END)
 
 agent_graph = builder.compile()
