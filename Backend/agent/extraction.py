@@ -385,6 +385,10 @@ Decide exactly one of two things:
    finish  -> action = "confirm"
 2. The candidate wants to CORRECT one specific field
    -> action = "correct", field = <field name>
+   - If they ALSO gave the new value in the same utterance,
+     set new_value to that value ONLY (not the whole sentence).
+   - If they only asked to change a field without saying the
+     new value, leave new_value empty/null.
 
 Always call resolve_summary_reply.
 
@@ -394,11 +398,16 @@ FIELDS THAT CAN BE CORRECTED:
 
 EXAMPLES:
 
-"تمام و صح و شكرا"        -> confirm
-"ايوة كده تمام خلاص"      -> confirm
-"غيرلي المؤهل"            -> correct, education_level
-"لأ عايز أعدل سنين الخبرة" -> correct, years_of_experience
-"اسمي غلط"                -> correct, candidate_name
+"تمام و صح و شكرا"                    -> confirm
+"ايوة كده تمام خلاص"                  -> confirm
+"غيرلي المؤهل"                        -> correct, education_level
+"لأ عايز أعدل سنين الخبرة"             -> correct, years_of_experience
+"اسمي غلط"                            -> correct, candidate_name
+"عدل الاسم اسمي طاهر"                 -> correct, candidate_name, new_value="طاهر"
+"update the name my name is taher"    -> correct, candidate_name, new_value="taher"
+"غيرلي الاسم، أنا اسمي أحمد علي"       -> correct, candidate_name, new_value="أحمد علي"
+"عدل المهارات لبايثون وجافا"           -> correct, key_skills, new_value="بايثون، جافا"
+"عايز أغير المجال لداتا ساينس"         -> correct, target_domain, new_value="داتا ساينس"
 
 CANDIDATE REPLY:
 
@@ -431,10 +440,30 @@ def _build_summary_reply_tool(fields: list[dict]) -> StructuredTool:
                 description="Required when action is 'correct'.",
             ),
         ),
+        new_value=(
+            str | None,
+            Field(
+                default=None,
+                description=(
+                    "The new field value if the candidate said it "
+                    "in the same utterance. For list fields, join "
+                    "items with an Arabic comma (،). Leave null "
+                    "when they only asked to change the field."
+                ),
+            ),
+        ),
     )
 
-    def resolve_summary_reply(action: str, field: str | None = None):
-        return {"action": action, "field": field}
+    def resolve_summary_reply(
+        action: str,
+        field: str | None = None,
+        new_value: str | None = None,
+    ):
+        return {
+            "action": action,
+            "field": field,
+            "new_value": new_value,
+        }
 
     return StructuredTool.from_function(
         func=resolve_summary_reply,
@@ -444,20 +473,63 @@ def _build_summary_reply_tool(fields: list[dict]) -> StructuredTool:
     )
 
 
+def parse_inline_correction_value(
+    field: dict,
+    new_value: str,
+) -> str | list[str] | None:
+    """
+    Turn the LLM's inline new_value string into the stored
+    candidate shape for this field (string, list, or NONE_VALUE).
+    """
+
+    text = new_value.strip()
+
+    if not text:
+        return None
+
+    if text.upper() == "NONE":
+        return NONE_VALUE
+
+    if field.get("multi"):
+
+        parts = [
+            part.strip()
+            for part in text.replace(",", "،").split("،")
+            if part.strip()
+        ]
+
+        if not parts:
+            return None
+
+        if len(parts) == 1 and parts[0].upper() == "NONE":
+            return NONE_VALUE
+
+        return [
+            part for part in parts if part.upper() != "NONE"
+        ] or None
+
+    return text
+
+
 async def classify_summary_reply(
     transcript: str,
     fields: list[dict],
 ) -> dict:
     """
-    Returns {"action": "confirm"}, {"action": "correct", "field":
-    ...}, or {"action": "unclear"} — the caller replays the summary
-    on "unclear" rather than guessing.
+    Returns:
+        {"action": "confirm"}
+        {"action": "correct", "field": ..., "new_value": str|None}
+        {"action": "unclear"}
+
+    When correcting, new_value is set only if the candidate gave
+    the replacement in the same utterance — the caller then applies
+    it without re-asking the question.
     """
 
     transcript = transcript.strip()
 
     if not transcript:
-        return {"action": "unclear", "field": None}
+        return {"action": "unclear", "field": None, "new_value": None}
 
     correctable = [f for f in fields if f.get("asked_by")]
 
@@ -481,17 +553,27 @@ async def classify_summary_reply(
     print("[SUMMARY] Tool calls:", response.tool_calls)
 
     if not response.tool_calls:
-        return {"action": "unclear", "field": None}
+        return {"action": "unclear", "field": None, "new_value": None}
 
     args = response.tool_calls[0].get("args", {})
 
     action = args.get("action")
     field = args.get("field")
+    new_value = args.get("new_value")
+
+    if isinstance(new_value, str):
+        new_value = new_value.strip() or None
+    else:
+        new_value = None
 
     if action == "confirm":
-        return {"action": "confirm", "field": None}
+        return {"action": "confirm", "field": None, "new_value": None}
 
     if action == "correct" and field:
-        return {"action": "correct", "field": field}
+        return {
+            "action": "correct",
+            "field": field,
+            "new_value": new_value,
+        }
 
-    return {"action": "unclear", "field": None}
+    return {"action": "unclear", "field": None, "new_value": None}

@@ -6,6 +6,7 @@ from Backend.agent.extraction import (
     build_summary_segments,
     classify_summary_reply,
     is_obviously_invalid,
+    parse_inline_correction_value,
     process_turn,
 )
 
@@ -433,8 +434,43 @@ async def process_summary_reply(state: AgentState) -> AgentState:
 
     if decision["action"] == "correct":
 
+        field_name = decision["field"]
+        inline_value = decision.get("new_value")
+
+        # ----------------------------------------------------
+        # Inline correction: they said what to change AND the
+        # new value in one utterance — apply it and rebuild the
+        # summary without re-asking the field question.
+        # ----------------------------------------------------
+
+        if inline_value and field_name:
+
+            field_def = interview_manager.get_field(field_name)
+
+            if field_def is not None:
+
+                parsed = parse_inline_correction_value(
+                    field_def, inline_value
+                )
+
+                if parsed is not None:
+
+                    candidate = dict(state["candidate"])
+                    candidate[field_name] = parsed
+
+                    print(
+                        "[GRAPH] Inline correction applied:",
+                        field_name,
+                        "=",
+                        parsed,
+                    )
+
+                    return _build_summary(
+                        {**state, "candidate": candidate}
+                    )
+
         target_question = interview_manager.question_for_field(
-            decision["field"]
+            field_name
         )
 
         if target_question is not None:
