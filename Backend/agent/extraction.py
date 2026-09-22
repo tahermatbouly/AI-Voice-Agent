@@ -79,11 +79,12 @@ def _build_update_tool(fields: list[dict]) -> StructuredTool:
         func=update_candidate_info,
         name="update_candidate_info",
         description=(
-            "Call this ONLY when the candidate actually answered "
-            "the CURRENT QUESTION with real information (or "
-            "explicitly said they don't have it). Never call this "
-            "for greetings, meta-conversation, or an answer to a "
-            "different question."
+            "Call this when the candidate answered the CURRENT "
+            "QUESTION with real information (or explicitly said "
+            "they don't have it). Also fill any OTHER listed "
+            "fields they clearly volunteered in the same "
+            "utterance. Never call this for greetings or "
+            "meta-conversation alone."
         ),
         args_schema=UpdateModel,
     )
@@ -151,15 +152,24 @@ TURN_PROMPT = """
 You are handling one turn of an Egyptian Arabic recruitment phone
 interview.
 
-CURRENT QUESTION (what was just asked):
+CURRENT QUESTION (what was just asked — this must be answered
+unless the candidate clearly already covered it in this utterance):
 
 {question}
+
+CURRENT QUESTION FIELDS (at least one of these must be filled if
+the candidate is answering normally):
+
+{current_fields}
 
 Decide exactly ONE of three things:
 
 1. The candidate ANSWERED the current question (or explicitly said
-   they don't have the thing being asked about)
-   -> call update_candidate_info
+   they don't have the thing being asked about). They may ALSO
+   volunteer answers to later questions in the same utterance
+   (e.g. name + years of experience together)
+   -> call update_candidate_info with EVERY field they clearly
+      stated — current and future. Leave unmentioned fields null.
 
 2. The candidate said something else entirely — they can't hear,
    ask you to repeat, ask who's calling, ask to be called later,
@@ -170,9 +180,11 @@ Decide exactly ONE of three things:
    -> call NOTHING
 
 Never call both tools. Never guess a field value you are not
-confident about.
+confident about. Never invent values for fields they did not
+mention.
 
-FIELDS THIS QUESTION CAN FILL:
+ALL FIELDS YOU MAY FILL THIS TURN (current + still-empty later
+ones):
 
 {fields}
 
@@ -190,6 +202,8 @@ RULES:
 - Only match an intent if the candidate's words clearly fit one of
   the situations above — a real (even partial) answer to the
   question always takes priority over an intent match.
+- Extra volunteered info is a bonus: still fill the current
+  question field(s) when they answered those too.
 
 CANDIDATE SAID:
 
@@ -202,6 +216,7 @@ async def process_turn(
     fields: list[dict],
     intents: list[dict],
     transcript: str,
+    current_fields: list[dict] | None = None,
 ) -> dict:
     """
     One LLM call that decides between three outcomes, so a normal
@@ -210,7 +225,13 @@ async def process_turn(
         {"kind": "answer", "updates": {...}}
         {"kind": "intent", "intent_id": "..."}
         {"kind": "none"}
+
+    `fields` may include later interview fields so volunteered
+    answers can be captured early. `current_fields` is what the
+    prompt highlights as required for this turn.
     """
+
+    current_fields = current_fields if current_fields is not None else fields
 
     update_tool = _build_update_tool(fields)
     intent_tool = _build_intent_tool(intents)
@@ -219,6 +240,7 @@ async def process_turn(
 
     prompt = TURN_PROMPT.format(
         question=question_text,
+        current_fields=_describe_fields(current_fields),
         fields=_describe_fields(fields),
         intents=_describe_intents(intents),
         transcript=transcript,

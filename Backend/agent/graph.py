@@ -129,19 +129,109 @@ async def start_interview(state: AgentState) -> AgentState:
 # Advance / summary helpers
 # ============================================================
 
+def _field_is_filled(candidate: dict, field_name: str) -> bool:
+    """True once we have a stored value, including explicit NONE."""
+
+    return (
+        field_name in candidate
+        and candidate[field_name] is not None
+    )
+
+
+def _question_is_satisfied(
+    question: dict,
+    candidate: dict,
+) -> bool:
+    """
+    A question is done when every field it asks for is already
+    filled — used to skip ahead when the candidate volunteered
+    answers earlier.
+    """
+
+    targets = interview_manager.target_fields(question)
+
+    if not targets:
+        return False
+
+    return all(
+        _field_is_filled(candidate, name) for name in targets
+    )
+
+
+def _extractable_fields(
+    question: dict,
+    candidate: dict,
+    *,
+    correcting: bool,
+) -> tuple[list[dict], list[dict]]:
+    """
+    Returns (current_fields, all_fields_for_tool).
+
+    In correcting mode only the fields for that question are
+    exposed. In interview mode the tool also sees every still-empty
+    interview field so volunteered future answers can be stored.
+    """
+
+    target_names = interview_manager.target_fields(question)
+
+    current_fields = [
+        f
+        for name in target_names
+        if (f := interview_manager.get_field(name)) is not None
+    ]
+
+    if correcting:
+        return current_fields, current_fields
+
+    seen = {f["name"] for f in current_fields}
+    extra = []
+
+    for field in interview_manager.fields:
+
+        name = field["name"]
+
+        if name in seen:
+            continue
+
+        if _field_is_filled(candidate, name):
+            continue
+
+        # Only pull in fields that belong to the interview sequence
+        # (or the free-form notes catch-all).
+        if field.get("asked_by") or name == "notes":
+            extra.append(field)
+            seen.add(name)
+
+    return current_fields, current_fields + extra
+
+
 def _advance_or_summarize(state: AgentState) -> AgentState:
 
     candidate = state["candidate"]
 
     next_index = state["current_question_index"] + 1
 
-    next_question = interview_manager.get_question(next_index)
+    while True:
 
-    if next_question is None:
+        next_question = interview_manager.get_question(next_index)
 
-        print("[GRAPH] Out of questions -> summary")
+        if next_question is None:
 
-        return _build_summary(state)
+            print("[GRAPH] Out of questions -> summary")
+
+            return _build_summary(state)
+
+        if _question_is_satisfied(next_question, candidate):
+
+            print(
+                "[GRAPH] Skipping already-filled question:",
+                next_question["id"],
+            )
+
+            next_index += 1
+            continue
+
+        break
 
     print("[GRAPH] Advancing to:", next_question["id"])
 
@@ -239,14 +329,16 @@ async def process_answer(state: AgentState) -> AgentState:
 
     target_field_names = interview_manager.target_fields(question)
 
-    fields = [
-        interview_manager.get_field(name) for name in target_field_names
-    ]
-    fields = [f for f in fields if f is not None]
+    current_fields, extractable_fields = _extractable_fields(
+        question,
+        candidate,
+        correcting=state["mode"] == "correcting",
+    )
 
     result = await process_turn(
         question_text=_plain_text(question["segments"], candidate),
-        fields=fields,
+        fields=extractable_fields,
+        current_fields=current_fields,
         intents=interview_manager.intents,
         transcript=transcript,
     )
@@ -270,10 +362,29 @@ async def process_answer(state: AgentState) -> AgentState:
         return _retry_or_skip(state, "wrong_answer")
 
     # ----------------------------------------------------
-    # Real answer.
+    # Real answer — may include future fields volunteered early.
     # ----------------------------------------------------
 
     candidate.update(result["updates"])
+
+    # The current question still must be addressed. Extra fields
+    # alone are not enough to move on.
+    if not any(
+        _field_is_filled(candidate, name)
+        for name in target_field_names
+    ):
+
+        print(
+            "[GRAPH] Updates missed current question fields:",
+            target_field_names,
+            "| got:",
+            list(result["updates"]),
+        )
+
+        return _retry_or_skip(
+            {**state, "candidate": candidate},
+            "wrong_answer",
+        )
 
     new_state = {**state, "candidate": candidate}
 

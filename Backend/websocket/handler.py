@@ -435,6 +435,13 @@ async def websocket_endpoint(
 
     mic_muted_until = 0.0
 
+    # Wall-clock time when the client's sequential TTS queue is
+    # expected to finish. Multi-segment turns (summary) send clips
+    # back-to-back, but the client plays them one after another —
+    # so mute/silence must cover the sum of durations, not only
+    # the last clip.
+    playback_ends_at = 0.0
+
     silence_task = None
 
     silence_level = 0
@@ -449,6 +456,7 @@ async def websocket_endpoint(
 
         nonlocal speech_active
         nonlocal mic_muted_until
+        nonlocal playback_ends_at
 
         text = seg.get("text")
 
@@ -567,16 +575,22 @@ async def websocket_endpoint(
                 "type": "tts_end",
             })
 
-            # Client plays after tts_end; mute until that playback ends.
-            mic_muted_until = (
-                time.monotonic()
+            # Queue this clip after any playback already scheduled.
+            # Silence must not start until the whole queue finishes.
+            now = time.monotonic()
+            queued_start = max(now, playback_ends_at)
+            playback_ends_at = (
+                queued_start
                 + duration_s
                 + TTS_TAIL_SECONDS
             )
+            mic_muted_until = playback_ends_at
 
             logger.info(
-                "[TTS] Finished | %s",
+                "[TTS] Finished | %s | "
+                "playback_ends_in=%.2fs",
                 item_id,
+                max(0.0, playback_ends_at - now),
             )
 
         except WebSocketDisconnect:
@@ -586,6 +600,7 @@ async def websocket_endpoint(
         except Exception as e:
 
             mic_muted_until = 0.0
+            playback_ends_at = 0.0
 
             logger.exception(
                 "[TTS] Failed to speak | %s",
@@ -624,6 +639,9 @@ async def websocket_endpoint(
     async def speak_turn(
         turn_state: dict,
     ):
+
+        # Never let a silence nudge overlap agent speech.
+        await stop_silence_timer()
 
         question = (
             turn_state.get(
@@ -669,6 +687,10 @@ async def websocket_endpoint(
                 current_prompt
             )
 
+        # Agent has finished *sending*; wait until the client has
+        # finished *hearing* before the caller starts silence.
+        await wait_until_listening()
+
     # ========================================================
     # SILENCE
     # ========================================================
@@ -692,17 +714,27 @@ async def websocket_endpoint(
             silence_task = None
 
     async def wait_until_listening():
-        """Block until TTS playback mute ends so silence is real silence."""
+        """
+        Block until TTS playback mute ends.
 
-        remaining = (
-            mic_muted_until
-            - time.monotonic()
-        )
+        Sleep in short slices so a temporary mic_muted_until=inf
+        (set while a new clip is being prepared) does not hang
+        forever after the real end time is written.
+        """
 
-        if remaining > 0:
+        while True:
+
+            remaining = (
+                mic_muted_until
+                - time.monotonic()
+            )
+
+            if remaining <= 0:
+
+                return
 
             await asyncio.sleep(
-                remaining
+                min(remaining, 0.25)
             )
 
     async def _finish(
