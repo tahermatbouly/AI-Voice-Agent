@@ -455,26 +455,18 @@ async def websocket_endpoint(
     # SPEAK ONE SEGMENT
     # ========================================================
 
-    async def speak_segment(
+    async def _resolve_segment_audio(
         seg: dict,
-    ):
-
-        nonlocal speech_active
-        nonlocal mic_muted_until
-        nonlocal playback_ends_at
+    ) -> tuple[bytes, int, str] | None:
+        """
+        Load or synthesize one segment's PCM without sending it.
+        Returns (audio, sample_rate, item_id) or None.
+        """
 
         text = seg.get("text")
 
         if not text:
-            return
-
-        mic_muted_until = float("inf")
-
-        speech_active = False
-
-        audio_buffer.clear()
-
-        vad.reset()
+            return None
 
         kind = seg.get(
             "kind",
@@ -483,136 +475,174 @@ async def websocket_endpoint(
 
         item_id = None
 
-        try:
+        if kind == "static":
 
-            if kind == "static":
+            item_id = seg["id"]
 
-                item_id = seg["id"]
+            cached = static_audio.get(
+                item_id
+            )
 
-                cached = static_audio.get(
-                    item_id
-                )
+            if cached is not None:
 
-                if cached is not None:
+                audio, sample_rate = cached
 
-                    audio, sample_rate = cached
-
-                    logger.info(
-                        "[TTS] Using pre-generated "
-                        "static clip | %s",
-                        item_id,
-                    )
-
-                else:
-
-                    logger.info(
-                        "[TTS] Static clip wasn't "
-                        "pre-generated | %s",
-                        item_id,
-                    )
-
-                    audio, sample_rate = (
-                        await _get_or_synthesize(
-                            tts,
-                            item_id,
-                            text,
-                        )
-                    )
-
-            else:
-
-                item_id = value_cache_id(
-                    text
-                )
-
-                task = value_tasks.get(
-                    item_id
-                )
-
-                if task is None:
-
-                    task = asyncio.create_task(
-                        _get_or_synthesize(
-                            tts,
-                            item_id,
-                            text,
-                        )
-                    )
-
-                    value_tasks[item_id] = task
-
-                audio, sample_rate = (
-                    await task
-                )
-
-            if not audio or sample_rate <= 0:
-
-                logger.warning(
-                    "[TTS] Empty audio | %s",
+                logger.info(
+                    "[TTS] Using pre-generated "
+                    "static clip | %s",
                     item_id,
                 )
 
-                return
-
-            duration_s = len(audio) / (
-                sample_rate * 2
-            )
-
-            logger.info(
-                "[TTS] Playing | id=%s | "
-                "duration=%.2fs | bytes=%d",
-                item_id,
-                duration_s,
-                len(audio),
-            )
-
-            await websocket.send_json({
-                "type": "tts_start",
-                "sample_rate": sample_rate,
-                "channels": 1,
-            })
-
-            for offset in range(
-                0,
-                len(audio),
-                TTS_SEND_CHUNK_SIZE,
-            ):
-
-                await websocket.send_bytes(
-                    audio[
-                        offset:
-                        offset + TTS_SEND_CHUNK_SIZE
-                    ]
-                )
-
-            await websocket.send_json({
-                "type": "tts_end",
-            })
-
-            now = time.monotonic()
-            queued_start = max(now, playback_ends_at)
-            playback_ends_at = (
-                queued_start
-                + duration_s
-                + TTS_TAIL_SECONDS
-            )
-
-            # While waiting for client ack, keep the mic hard-muted
-            # so silence cannot start mid-summary.
-            if awaiting_playback_ack:
-
-                mic_muted_until = float("inf")
-
             else:
 
-                mic_muted_until = playback_ends_at
+                logger.info(
+                    "[TTS] Static clip wasn't "
+                    "pre-generated | %s",
+                    item_id,
+                )
 
-            logger.info(
-                "[TTS] Finished | %s | "
-                "playback_ends_in=%.2fs | awaiting_ack=%s",
+                audio, sample_rate = (
+                    await _get_or_synthesize(
+                        tts,
+                        item_id,
+                        text,
+                    )
+                )
+
+        else:
+
+            item_id = value_cache_id(
+                text
+            )
+
+            task = value_tasks.get(
+                item_id
+            )
+
+            if task is None:
+
+                task = asyncio.create_task(
+                    _get_or_synthesize(
+                        tts,
+                        item_id,
+                        text,
+                    )
+                )
+
+                value_tasks[item_id] = task
+
+            audio, sample_rate = (
+                await task
+            )
+
+        if not audio or sample_rate <= 0:
+
+            logger.warning(
+                "[TTS] Empty audio | %s",
                 item_id,
-                max(0.0, playback_ends_at - now),
-                awaiting_playback_ack,
+            )
+
+            return None
+
+        return audio, sample_rate, item_id
+
+    async def _send_pcm(
+        audio: bytes,
+        sample_rate: int,
+        item_id: str,
+    ):
+        """Stream one PCM clip to the client and update mute timing."""
+
+        nonlocal speech_active
+        nonlocal mic_muted_until
+        nonlocal playback_ends_at
+
+        mic_muted_until = float("inf")
+        speech_active = False
+        audio_buffer.clear()
+        vad.reset()
+
+        duration_s = len(audio) / (
+            sample_rate * 2
+        )
+
+        logger.info(
+            "[TTS] Playing | id=%s | "
+            "duration=%.2fs | bytes=%d",
+            item_id,
+            duration_s,
+            len(audio),
+        )
+
+        await websocket.send_json({
+            "type": "tts_start",
+            "sample_rate": sample_rate,
+            "channels": 1,
+        })
+
+        for offset in range(
+            0,
+            len(audio),
+            TTS_SEND_CHUNK_SIZE,
+        ):
+
+            await websocket.send_bytes(
+                audio[
+                    offset:
+                    offset + TTS_SEND_CHUNK_SIZE
+                ]
+            )
+
+        await websocket.send_json({
+            "type": "tts_end",
+        })
+
+        now = time.monotonic()
+        queued_start = max(now, playback_ends_at)
+        playback_ends_at = (
+            queued_start
+            + duration_s
+            + TTS_TAIL_SECONDS
+        )
+
+        if awaiting_playback_ack:
+
+            mic_muted_until = float("inf")
+
+        else:
+
+            mic_muted_until = playback_ends_at
+
+        logger.info(
+            "[TTS] Finished | %s | "
+            "playback_ends_in=%.2fs | awaiting_ack=%s",
+            item_id,
+            max(0.0, playback_ends_at - now),
+            awaiting_playback_ack,
+        )
+
+    async def speak_segment(
+        seg: dict,
+    ):
+
+        nonlocal mic_muted_until
+
+        try:
+
+            resolved = await _resolve_segment_audio(
+                seg
+            )
+
+            if resolved is None:
+
+                return
+
+            audio, sample_rate, item_id = resolved
+
+            await _send_pcm(
+                audio,
+                sample_rate,
+                item_id,
             )
 
         except WebSocketDisconnect:
@@ -621,7 +651,6 @@ async def websocket_endpoint(
 
         except Exception as e:
 
-            # Keep prior playback queue — earlier clips may still play.
             if not awaiting_playback_ack:
 
                 mic_muted_until = max(
@@ -631,7 +660,7 @@ async def websocket_endpoint(
 
             logger.exception(
                 "[TTS] Failed to speak | %s",
-                item_id,
+                seg.get("id") or seg.get("text"),
             )
 
             try:
@@ -646,18 +675,108 @@ async def websocket_endpoint(
                 pass
 
     # ========================================================
-    # SPEAK SEGMENTS
+    # SPEAK SEGMENTS (merged into one continuous clip)
     # ========================================================
+    # Questions like "أهلاً يا" + {name} + "حضرتك مهتم..." used to
+    # be three separate TTS sends. The client played each with a
+    # tail gap, and the name often wasn't ready until after
+    # "أهلاً يا" finished — an awkward silence. Prefetch every
+    # segment in parallel, stitch the PCM, and send once.
 
     async def speak_segments(
         segments: list[dict],
     ):
 
-        for seg in segments:
+        nonlocal mic_muted_until
 
-            await speak_segment(
-                seg
+        if not segments:
+
+            return
+
+        try:
+
+            resolved = await asyncio.gather(*[
+                _resolve_segment_audio(seg)
+                for seg in segments
+            ])
+
+            parts = [
+                item for item in resolved
+                if item is not None
+            ]
+
+            if not parts:
+
+                return
+
+            rates = {rate for _, rate, _ in parts}
+
+            if len(rates) != 1:
+
+                logger.warning(
+                    "[TTS] Mixed sample rates in turn "
+                    "(%s) — sending clips separately",
+                    rates,
+                )
+
+                for audio, sample_rate, item_id in parts:
+
+                    await _send_pcm(
+                        audio,
+                        sample_rate,
+                        item_id,
+                    )
+
+                return
+
+            sample_rate = parts[0][1]
+            merged = b"".join(
+                audio for audio, _, _ in parts
             )
+            item_id = "+".join(
+                item_id for _, _, item_id in parts
+            )
+
+            logger.info(
+                "[TTS] Merged %d segments | id=%s | bytes=%d",
+                len(parts),
+                item_id,
+                len(merged),
+            )
+
+            await _send_pcm(
+                merged,
+                sample_rate,
+                item_id,
+            )
+
+        except WebSocketDisconnect:
+
+            raise
+
+        except Exception as e:
+
+            if not awaiting_playback_ack:
+
+                mic_muted_until = max(
+                    playback_ends_at,
+                    time.monotonic(),
+                )
+
+            logger.exception(
+                "[TTS] Failed to speak merged segments"
+            )
+
+            try:
+
+                await websocket.send_json({
+                    "type": "error",
+                    "stage": "tts",
+                    "message": str(e),
+                })
+
+            except Exception:
+                pass
 
     # ========================================================
     # PLAYBACK ACK
