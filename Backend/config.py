@@ -25,7 +25,7 @@ VOICETUT_API_URL = os.getenv(
 
 VOICETUT_SPEAKER = os.getenv(
     "VOICETUT_SPEAKER",
-    "Mohamed",
+    "Esraa",
 )
 
 VOICETUT_SAMPLE_RATE = int(
